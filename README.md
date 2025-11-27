@@ -1,4 +1,4 @@
-# ExamPrep AI
+# Chunk AI
 
 An AI-powered exam preparation system where students can upload PPTs/PDFs/handwritten notes and get exam-ready answers structured by marks.
 
