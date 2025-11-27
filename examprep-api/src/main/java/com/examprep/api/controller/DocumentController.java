@@ -16,10 +16,13 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
+
+import jakarta.servlet.http.HttpServletRequest;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -37,11 +40,23 @@ public class DocumentController {
     private final UserRepository userRepository;
     private final FileStorageService fileStorageService;
     
-    @PostMapping("/upload")
+    @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<DocumentResponse> uploadDocument(
             @RequestParam("file") MultipartFile file,
-            Authentication authentication
+            Authentication authentication,
+            HttpServletRequest request
     ) {
+        log.debug("Upload request received. Content-Type: {}", request.getContentType());
+        log.debug("File received: name={}, size={}, contentType={}", 
+            file != null ? file.getOriginalFilename() : "null",
+            file != null ? file.getSize() : 0,
+            file != null ? file.getContentType() : "null");
+        
+        if (file == null || file.isEmpty()) {
+            log.error("File is null or empty. Content-Type: {}", request.getContentType());
+            return ResponseEntity.badRequest().build();
+        }
+        
         UUID userId = UUID.fromString(authentication.getName());
         User user = userRepository.findById(userId)
             .orElseThrow(() -> new RuntimeException("User not found"));

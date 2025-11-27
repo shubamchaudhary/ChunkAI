@@ -3,6 +3,7 @@ package com.examprep.data.entity;
 import jakarta.persistence.*;
 import lombok.*;
 import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.type.SqlTypes;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -37,6 +38,7 @@ public class QueryHistory {
     private String answerText;
     
     @Column(name = "sources_used", columnDefinition = "jsonb")
+    @org.hibernate.annotations.JdbcTypeCode(SqlTypes.JSON)
     private String sourcesUsed;
     
     @Column(name = "retrieval_time_ms")

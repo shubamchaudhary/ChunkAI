@@ -43,9 +43,16 @@ public class RagService {
         // Step 2: Retrieve similar chunks
         log.info("Searching for similar chunks for user: {}", userId);
         String vectorString = embeddingService.toVectorString(queryEmbedding);
-        UUID[] docIdArray = documentIds != null ? documentIds.toArray(new UUID[0]) : null;
         
-        List<DocumentChunk> relevantChunks = chunkRepository.findSimilarChunks(
+        UUID[] docIdArray = (documentIds != null && !documentIds.isEmpty()) 
+            ? documentIds.toArray(new UUID[0]) 
+            : null;
+        
+        log.debug("Vector string length: {}, Document IDs: {}", 
+            vectorString.length(), 
+            docIdArray != null ? docIdArray.length : "all");
+        
+        List<DocumentChunk> relevantChunks = chunkRepository.findSimilarChunksCustom(
             userId,
             vectorString,
             docIdArray,
@@ -53,12 +60,16 @@ public class RagService {
         );
         long retrievalTime = System.currentTimeMillis() - startTime - embeddingTime;
         
+        log.info("Found {} relevant chunks for query", relevantChunks.size());
+        
         if (relevantChunks.isEmpty()) {
+            log.warn("No chunks found for user {} with query: {}", userId, question);
             return RagResult.builder()
                 .answer("I couldn't find relevant information in your documents to answer this question. Please make sure you've uploaded documents related to this topic.")
                 .sources(List.of())
                 .retrievalTimeMs(retrievalTime)
                 .generationTimeMs(0L)
+                .chunksUsed(0)
                 .build();
         }
         

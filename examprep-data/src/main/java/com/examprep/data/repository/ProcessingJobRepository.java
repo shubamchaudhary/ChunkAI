@@ -4,6 +4,7 @@ import com.examprep.data.entity.ProcessingJob;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import jakarta.persistence.LockModeType;
@@ -26,6 +27,6 @@ public interface ProcessingJobRepository extends JpaRepository<ProcessingJob, UU
           AND (pj.lockedUntil IS NULL OR pj.lockedUntil < :now)
         ORDER BY pj.priority ASC, pj.createdAt ASC
         """)
-    List<ProcessingJob> findNextQueuedJob(Instant now);
+    List<ProcessingJob> findNextQueuedJob(@Param("now") Instant now);
 }
 
