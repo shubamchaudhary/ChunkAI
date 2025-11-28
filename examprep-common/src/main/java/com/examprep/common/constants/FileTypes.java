@@ -12,7 +12,7 @@ public final class FileTypes {
     public static final Set<String> IMAGE_TYPES = Set.of("png", "jpg", "jpeg", "gif", "bmp");
     public static final Set<String> TEXT_TYPES = Set.of("txt");
     
-    public static final long MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
+    public static final long MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024; // 1GB - ChatGPT/Claude-like capacity
     
     private FileTypes() {}
     

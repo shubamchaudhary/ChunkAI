@@ -41,6 +41,10 @@ public class DocumentProcessingService {
         try {
             log.info("Starting processing for document: {}", document.getFileName());
             
+            // Delete existing chunks if reprocessing (prevents duplicate key violations)
+            chunkRepository.deleteByDocumentId(documentId);
+            log.debug("Deleted existing chunks for document: {}", documentId);
+            
             // Update status to PROCESSING
             document.setProcessingStatus(ProcessingStatus.PROCESSING);
             document.setProcessingStartedAt(java.time.Instant.now());
@@ -76,6 +80,7 @@ public class DocumentProcessingService {
                 DocumentChunk documentChunk = DocumentChunk.builder()
                     .document(document)
                     .userId(document.getUser().getId())
+                    .chatId(document.getChat().getId())
                     .chunkIndex(chunk.getChunkIndex())
                     .content(chunk.getContent())
                     .contentHash(computeHash(chunk.getContent()))

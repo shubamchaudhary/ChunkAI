@@ -286,5 +286,106 @@ Before sending the upload request:
 
 ---
 
+## 📦 Bulk Upload (Multiple Files)
+
+### For uploading 15 files (or any multiple files):
+
+1. **Set Request Method**: `POST`
+2. **Set URL**: `http://localhost:8080/api/v1/documents/upload/bulk` ⚠️ **Note: `/bulk` at the end**
+3. **Add Authorization Header**:
+   - Go to **Headers** tab
+   - Add: `Authorization: Bearer YOUR_TOKEN_HERE`
+
+4. **Set Body Type**:
+   - Go to **Body** tab
+   - Select **form-data** (NOT raw, NOT x-www-form-urlencoded)
+
+5. **Add Files Field**:
+   - In the form-data section, add a key-value pair
+   - **Key name**: Type `files` (plural, lowercase) ⚠️ **Important: `files` not `file`**
+   - **Type**: Click the dropdown next to the key and select **File** (not Text)
+   - **Value**: Click "Select Files" and choose **multiple files** (hold Ctrl/Cmd to select multiple)
+
+6. **Send Request**
+
+### Postman Bulk Upload Setup:
+
+```
+┌─────────────────────────────────────────┐
+│ POST http://localhost:8080/api/v1/...  │
+│                    /upload/bulk         │
+├─────────────────────────────────────────┤
+│ Headers                                  │
+│ ┌─────────────────────────────────────┐ │
+│ │ Authorization: Bearer eyJhbGci...   │ │
+│ └─────────────────────────────────────┘ │
+├─────────────────────────────────────────┤
+│ Body                                     │
+│ ○ none  ○ form-data  ○ x-www-form...    │
+│                                         │
+│ Key          │ Value  │ Type            │
+│ ┌──────────┐ │ ┌────┐ │ ┌───────────┐ │
+│ │ files    │ │ │... │ │ │ File ▼    │ │
+│ └──────────┘ │ └────┘ │ └───────────┘ │
+│              │        │               │
+│              │ [Select Files]        │
+│              │ (Select multiple)     │
+└─────────────────────────────────────────┘
+```
+
+### ⚠️ Key Differences: Single vs Bulk Upload
+
+| Feature | Single Upload | Bulk Upload |
+|---------|--------------|-------------|
+| **URL** | `/api/v1/documents/upload` | `/api/v1/documents/upload/bulk` |
+| **Key Name** | `file` (singular) | `files` (plural) |
+| **Files** | 1 file | Up to 20 files |
+| **Response** | Single `DocumentResponse` | `BulkUploadResponse` with arrays |
+
+### 📋 Bulk Upload Response Example:
+
+```json
+{
+  "uploads": [
+    {
+      "id": "uuid-1",
+      "fileName": "document1.pdf",
+      "processingStatus": "PENDING"
+    },
+    {
+      "id": "uuid-2",
+      "fileName": "document2.pdf",
+      "processingStatus": "PENDING"
+    }
+  ],
+  "totalQueued": 12,
+  "duplicates": [
+    {
+      "fileName": "duplicate.pdf",
+      "fileSizeBytes": 12345,
+      "existingDocumentId": "uuid-existing",
+      "existingDocumentCreatedAt": "2025-11-27T..."
+    }
+  ],
+  "errors": [],
+  "totalFiles": 15,
+  "successfulUploads": 12,
+  "duplicateCount": 3,
+  "errorCount": 0,
+  "message": "Successfully uploaded 12 file(s). 3 duplicate file(s) skipped."
+}
+```
+
+### ✅ Quick Checklist for Bulk Upload:
+
+- [ ] URL ends with `/bulk`: `http://localhost:8080/api/v1/documents/upload/bulk`
+- [ ] Key name is `files` (plural, not `file`)
+- [ ] Type is **File** (not Text)
+- [ ] Multiple files selected (hold Ctrl/Cmd)
+- [ ] Authorization header is set
+- [ ] Body type is `form-data`
+
+---
+
 Happy testing! 🚀
 

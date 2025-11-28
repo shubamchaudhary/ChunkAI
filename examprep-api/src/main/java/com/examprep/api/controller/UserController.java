@@ -13,6 +13,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 @RestController
@@ -36,12 +37,27 @@ public class UserController {
         Long storageUsed = documentRepository.getTotalStorageByUserId(userId);
         if (storageUsed == null) storageUsed = 0L;
         
-        // Count queries this month
+        // Count queries this month using native query
         Instant startOfMonth = Instant.now().minusSeconds(30 * 24 * 60 * 60);
-        long queriesThisMonth = queryHistoryRepository.findByUser_IdOrderByCreatedAtDesc(userId, 
-            org.springframework.data.domain.Pageable.unpaged())
-            .stream()
-            .filter(q -> q.getCreatedAt().isAfter(startOfMonth))
+        List<Object[]> recentQueries = queryHistoryRepository.findHistoryByUserIdNative(
+            userId, 
+            org.springframework.data.domain.PageRequest.of(0, 1000)
+        );
+        long queriesThisMonth = recentQueries.stream()
+            .filter(row -> {
+                if (row[11] == null) return false;
+                java.time.Instant createdAt;
+                if (row[11] instanceof java.time.Instant) {
+                    createdAt = (java.time.Instant) row[11];
+                } else if (row[11] instanceof java.sql.Timestamp) {
+                    createdAt = ((java.sql.Timestamp) row[11]).toInstant();
+                } else if (row[11] instanceof java.time.OffsetDateTime) {
+                    createdAt = ((java.time.OffsetDateTime) row[11]).toInstant();
+                } else {
+                    return false;
+                }
+                return createdAt.isAfter(startOfMonth);
+            })
             .count();
         
         UserProfileResponse response = UserProfileResponse.builder()

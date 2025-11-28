@@ -15,6 +15,9 @@ public class GeminiConfig {
     private String generationModel = "gemini-2.5-flash";
     private String baseUrl = "https://generativelanguage.googleapis.com/v1beta";
     private int maxRetries = 3;
-    private int timeoutSeconds = 30;
+    private int timeoutSeconds = 60;
+    private int maxOutputTokens = 8192; // Max for Gemini 2.5 Flash
+    private int maxContextChunks = 100; // Max chunks to retrieve for context
+    private int maxConversationHistory = 50; // Max Q&A pairs in conversation history
 }
 

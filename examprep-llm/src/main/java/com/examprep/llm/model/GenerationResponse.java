@@ -14,6 +14,12 @@ public class GenerationResponse {
     public static class Candidate {
         @JsonProperty("content")
         private Content content;
+        
+        @JsonProperty("finishReason")
+        private String finishReason;
+        
+        @JsonProperty("finishMessage")
+        private String finishMessage;
     }
     
     @Data

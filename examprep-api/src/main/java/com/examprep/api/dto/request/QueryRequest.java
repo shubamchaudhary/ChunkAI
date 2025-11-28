@@ -17,5 +17,9 @@ public class QueryRequest {
     private List<UUID> documentIds;
     
     private String formatInstructions;
+    
+    private UUID chatId; // Required for chat-scoped queries
+    
+    private Boolean useCrossChat = false; // Default: false (chat-scoped), true = search all user's chats
 }
 

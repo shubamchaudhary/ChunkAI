@@ -5,8 +5,11 @@ import com.examprep.data.entity.Document;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.Optional;
@@ -38,5 +41,50 @@ public interface DocumentRepository extends JpaRepository<Document, UUID> {
     Long getTotalStorageByUserId(UUID userId);
     
     long countByUserId(UUID userId);
+    
+    /**
+     * Check if a document with the same original filename and file size exists for the user.
+     * Used for duplicate detection.
+     */
+    Optional<Document> findByUserIdAndOriginalFileNameAndFileSizeBytes(
+        UUID userId,
+        String originalFileName,
+        Long fileSizeBytes
+    );
+    
+    // Chat-scoped queries
+    Page<Document> findByChatId(UUID chatId, Pageable pageable);
+    
+    List<Document> findByChatId(UUID chatId);
+    
+    Optional<Document> findByIdAndChatId(UUID id, UUID chatId);
+    
+    /**
+     * Find document by ID, chat ID, and user ID (for security verification)
+     */
+    @Query("SELECT d FROM Document d WHERE d.id = :id AND d.chat.id = :chatId AND d.user.id = :userId")
+    Optional<Document> findByIdAndChatIdAndUserId(
+        @Param("id") UUID id,
+        @Param("chatId") UUID chatId,
+        @Param("userId") UUID userId
+    );
+    
+    /**
+     * Check if a document with the same original filename and file size exists in a chat.
+     * Used for duplicate detection within a chat.
+     */
+    Optional<Document> findByChatIdAndOriginalFileNameAndFileSizeBytes(
+        UUID chatId,
+        String originalFileName,
+        Long fileSizeBytes
+    );
+    
+    long countByChatId(UUID chatId);
+    
+    // Use native query to delete documents without loading related entities
+    @Modifying
+    @Transactional
+    @Query(value = "DELETE FROM documents WHERE chat_id = :chatId", nativeQuery = true)
+    void deleteByChatId(@Param("chatId") UUID chatId);
 }
 

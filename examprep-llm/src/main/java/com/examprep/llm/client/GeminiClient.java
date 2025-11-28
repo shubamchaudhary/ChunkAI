@@ -74,6 +74,16 @@ public class GeminiClient {
      * Generate text using Gemini Flash
      */
     public String generateContent(String prompt, String systemInstruction) {
+        return generateContent(prompt, systemInstruction, false);
+    }
+    
+    /**
+     * Generate text using Gemini Flash with optional Google Search grounding
+     * @param prompt The user prompt
+     * @param systemInstruction The system instruction
+     * @param useGoogleSearch If true, enables Google Search grounding for internet access
+     */
+    public String generateContent(String prompt, String systemInstruction, boolean useGoogleSearch) {
         String url = String.format(
             "%s/models/%s:generateContent?key=%s",
             config.getBaseUrl(),
@@ -81,19 +91,28 @@ public class GeminiClient {
             config.getApiKey()
         );
         
-        Map<String, Object> request = Map.of(
-            "contents", List.of(
-                Map.of("parts", List.of(Map.of("text", prompt)))
-            ),
-            "systemInstruction", Map.of(
-                "parts", List.of(Map.of("text", systemInstruction))
-            ),
-            "generationConfig", Map.of(
-                "temperature", 0.7,
-                "topP", 0.95,
-                "maxOutputTokens", 8192
-            )
-        );
+        java.util.Map<String, Object> requestMap = new java.util.HashMap<>();
+        requestMap.put("contents", List.of(
+            Map.of("parts", List.of(Map.of("text", prompt)))
+        ));
+        requestMap.put("systemInstruction", Map.of(
+            "parts", List.of(Map.of("text", systemInstruction))
+        ));
+        requestMap.put("generationConfig", Map.of(
+            "temperature", 0.7,
+            "topP", 0.95,
+            "maxOutputTokens", config.getMaxOutputTokens()  // Configurable max output tokens
+        ));
+        
+        // Enable Google Search grounding if requested
+        if (useGoogleSearch) {
+            requestMap.put("tools", List.of(
+                Map.of("googleSearch", Map.of())
+            ));
+            log.info("Google Search grounding enabled for this request");
+        }
+        
+        Map<String, Object> request = Map.copyOf(requestMap);
         
         try {
             GenerationResponse response = webClientBuilder.build()
@@ -108,7 +127,23 @@ public class GeminiClient {
                 throw new RuntimeException("Failed to generate content: response was null or empty");
             }
             
-            return response.getCandidates().get(0).getContent().getParts().get(0).getText();
+            GenerationResponse.Candidate candidate = response.getCandidates().get(0);
+            String text = candidate.getContent().getParts().get(0).getText();
+            
+            // Check if response was truncated
+            String finishReason = candidate.getFinishReason();
+            if (finishReason != null && !finishReason.equals("STOP")) {
+                log.warn("Gemini response finished with reason: {} (message: {}). Response may be truncated.", 
+                    finishReason, candidate.getFinishMessage());
+                if (finishReason.equals("MAX_TOKENS")) {
+                    log.error("Response was truncated due to MAX_TOKENS limit. Consider increasing maxOutputTokens.");
+                }
+            }
+            
+            log.debug("Generated content length: {} characters. Finish reason: {}. Google Search: {}", 
+                text.length(), finishReason, useGoogleSearch);
+            
+            return text;
         } catch (org.springframework.web.reactive.function.client.WebClientResponseException e) {
             log.error("Gemini API error: Status={}, URL={}, Response={}", 
                 e.getStatusCode(), 

@@ -37,12 +37,30 @@ CREATE TABLE users (
 CREATE INDEX idx_users_email ON users(email);
 
 -- ============================================
+-- CHATS TABLE
+-- Stores chat sessions for users
+-- ============================================
+CREATE TABLE chats (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL DEFAULT 'New Chat',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Indexes for chats
+CREATE INDEX idx_chats_user_id ON chats(user_id);
+CREATE INDEX idx_chats_user_updated ON chats(user_id, updated_at DESC);
+
+-- ============================================
 -- DOCUMENTS TABLE
 -- Stores metadata about uploaded files
+-- Now scoped to userID-chatID-docID
 -- ============================================
 CREATE TABLE documents (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    chat_id UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
     
     -- File metadata
     file_name VARCHAR(500) NOT NULL,
@@ -70,8 +88,12 @@ CREATE TABLE documents (
 
 -- Indexes for common queries
 CREATE INDEX idx_documents_user_id ON documents(user_id);
+CREATE INDEX idx_documents_chat_id ON documents(chat_id);
+CREATE INDEX idx_documents_user_chat ON documents(user_id, chat_id);
 CREATE INDEX idx_documents_user_status ON documents(user_id, processing_status);
 CREATE INDEX idx_documents_created_at ON documents(created_at DESC);
+-- Index for duplicate detection (filename + size check per chat)
+CREATE INDEX idx_documents_chat_filename_size ON documents(chat_id, original_file_name, file_size_bytes);
 
 -- ============================================
 -- DOCUMENT_CHUNKS TABLE
@@ -83,6 +105,7 @@ CREATE TABLE document_chunks (
     -- Foreign keys
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,  -- Denormalized for fast filtering
+    chat_id UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,  -- Denormalized for fast filtering
     
     -- Chunk content
     chunk_index INTEGER NOT NULL,  -- Order within document
@@ -114,6 +137,9 @@ WITH (m = 16, ef_construction = 64);
 
 -- Index for user-scoped queries (CRITICAL for multi-tenancy)
 CREATE INDEX idx_chunks_user_id ON document_chunks(user_id);
+
+-- Composite index for user + chat queries (for chat-scoped search)
+CREATE INDEX idx_chunks_user_chat ON document_chunks(user_id, chat_id);
 
 -- Composite index for user + document queries
 CREATE INDEX idx_chunks_user_document ON document_chunks(user_id, document_id);
@@ -159,6 +185,7 @@ WHERE status = 'QUEUED';
 CREATE TABLE query_history (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    chat_id UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
     
     -- Query details
     query_text TEXT NOT NULL,

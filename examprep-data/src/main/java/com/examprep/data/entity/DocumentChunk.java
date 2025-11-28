@@ -27,6 +27,9 @@ public class DocumentChunk {
     @Column(name = "user_id", nullable = false)
     private UUID userId;
     
+    @Column(name = "chat_id", nullable = false)
+    private UUID chatId;
+    
     @Column(name = "chunk_index", nullable = false)
     private Integer chunkIndex;
     

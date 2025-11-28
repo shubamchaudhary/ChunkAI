@@ -4,6 +4,7 @@ import com.examprep.data.entity.DocumentChunk;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import jakarta.persistence.Query;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Repository;
 
 import java.util.LinkedHashMap;
@@ -13,6 +14,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 @Repository
+@Slf4j
 public class DocumentChunkRepositoryImpl implements DocumentChunkRepositoryCustom {
     
     @PersistenceContext
@@ -23,40 +25,54 @@ public class DocumentChunkRepositoryImpl implements DocumentChunkRepositoryCusto
         UUID userId,
         String queryEmbedding,
         UUID[] documentIds,
+        UUID chatId,
+        boolean useCrossChat,
         int limit
     ) {
         String sql;
         Query query;
         
-        if (documentIds != null && documentIds.length > 0) {
-            // Search specific documents - select only IDs to avoid vector mapping issues
-            sql = """
-                SELECT dc.id FROM document_chunks dc
-                JOIN documents d ON dc.document_id = d.id
-                WHERE dc.user_id = :userId
-                  AND d.processing_status = 'COMPLETED'
-                  AND dc.document_id = ANY(CAST(:documentIds AS uuid[]))
-                ORDER BY dc.embedding <=> CAST(:queryEmbedding AS vector)
-                LIMIT :limit
-                """;
-            query = entityManager.createNativeQuery(sql);
-            query.setParameter("documentIds", documentIds);
+        // Build WHERE clause based on search scope
+        StringBuilder sqlBuilder = new StringBuilder();
+        sqlBuilder.append("SELECT dc.id FROM document_chunks dc ");
+        sqlBuilder.append("JOIN documents d ON dc.document_id = d.id ");
+        sqlBuilder.append("WHERE dc.user_id = :userId ");
+        sqlBuilder.append("AND d.processing_status = 'COMPLETED' ");
+        
+        // Strict filtering: When useCrossChat is false, MUST filter by chatId
+        // When useCrossChat is true, search across all user's chats (no chatId filter)
+        if (!useCrossChat) {
+            if (chatId == null) {
+                // If chatId is null and useCrossChat is false, return empty results (no chat specified)
+                log.warn("useCrossChat is false but chatId is null - returning empty results");
+                return List.of();
+            }
+            sqlBuilder.append("AND dc.chat_id = :chatId ");
+            log.debug("Filtering by chatId: {} (useCrossChat: false)", chatId);
         } else {
-            // Search all user's documents - select only IDs to avoid vector mapping issues
-            sql = """
-                SELECT dc.id FROM document_chunks dc
-                JOIN documents d ON dc.document_id = d.id
-                WHERE dc.user_id = :userId
-                  AND d.processing_status = 'COMPLETED'
-                ORDER BY dc.embedding <=> CAST(:queryEmbedding AS vector)
-                LIMIT :limit
-                """;
-            query = entityManager.createNativeQuery(sql);
+            log.debug("Searching across all chats (useCrossChat: true)");
         }
         
+        if (documentIds != null && documentIds.length > 0) {
+            sqlBuilder.append("AND dc.document_id = ANY(CAST(:documentIds AS uuid[])) ");
+        }
+        
+        sqlBuilder.append("ORDER BY dc.embedding <=> CAST(:queryEmbedding AS vector) ");
+        sqlBuilder.append("LIMIT :limit");
+        
+        sql = sqlBuilder.toString();
+        query = entityManager.createNativeQuery(sql);
         query.setParameter("userId", userId);
         query.setParameter("queryEmbedding", queryEmbedding);
         query.setParameter("limit", limit);
+        
+        if (documentIds != null && documentIds.length > 0) {
+            query.setParameter("documentIds", documentIds);
+        }
+        
+        if (!useCrossChat && chatId != null) {
+            query.setParameter("chatId", chatId);
+        }
         
         @SuppressWarnings("unchecked")
         List<Object> idResults = query.getResultList();
@@ -71,15 +87,26 @@ public class DocumentChunkRepositoryImpl implements DocumentChunkRepositoryCusto
         }
         
         // Load entities using native query that excludes embedding column to avoid vector type issues
-        // Then load embedding separately if needed (we don't need it for RAG, just content)
-        String loadSql = """
-            SELECT id, document_id, user_id, chunk_index, content, content_hash, 
+        // Add additional chatId filter for safety (double-check)
+        StringBuilder loadSqlBuilder = new StringBuilder();
+        loadSqlBuilder.append("""
+            SELECT id, document_id, user_id, chat_id, chunk_index, content, content_hash, 
                    page_number, slide_number, section_title, token_count, created_at
             FROM document_chunks
             WHERE id = ANY(CAST(:ids AS uuid[]))
-            """;
-        Query loadQuery = entityManager.createNativeQuery(loadSql);
+            """);
+        
+        // Add chatId filter if not using cross-chat search (extra safety check)
+        if (!useCrossChat && chatId != null) {
+            loadSqlBuilder.append(" AND chat_id = :chatId ");
+        }
+        
+        Query loadQuery = entityManager.createNativeQuery(loadSqlBuilder.toString());
         loadQuery.setParameter("ids", chunkIds.toArray(new UUID[0]));
+        
+        if (!useCrossChat && chatId != null) {
+            loadQuery.setParameter("chatId", chatId);
+        }
         
         @SuppressWarnings("unchecked")
         List<Object[]> results = loadQuery.getResultList();
@@ -90,27 +117,29 @@ public class DocumentChunkRepositoryImpl implements DocumentChunkRepositoryCusto
             UUID id = (UUID) row[0];
             UUID docId = (UUID) row[1];
             UUID chunkUserId = (UUID) row[2];
-            Integer chunkIndex = (Integer) row[3];
-            String content = (String) row[4];
-            String contentHash = (String) row[5];
-            Integer pageNumber = row[6] != null ? (Integer) row[6] : null;
-            Integer slideNumber = row[7] != null ? (Integer) row[7] : null;
-            String sectionTitle = (String) row[8];
-            Integer tokenCount = row[9] != null ? (Integer) row[9] : null;
+            UUID chunkChatId = (UUID) row[3];
+            Integer chunkIndex = (Integer) row[4];
+            String content = (String) row[5];
+            String contentHash = (String) row[6];
+            Integer pageNumber = row[7] != null ? (Integer) row[7] : null;
+            Integer slideNumber = row[8] != null ? (Integer) row[8] : null;
+            String sectionTitle = (String) row[9];
+            Integer tokenCount = row[10] != null ? (Integer) row[10] : null;
             java.time.Instant createdAt = null;
-            if (row[10] != null) {
-                if (row[10] instanceof java.time.Instant) {
-                    createdAt = (java.time.Instant) row[10];
-                } else if (row[10] instanceof java.sql.Timestamp) {
-                    createdAt = ((java.sql.Timestamp) row[10]).toInstant();
-                } else if (row[10] instanceof java.time.OffsetDateTime) {
-                    createdAt = ((java.time.OffsetDateTime) row[10]).toInstant();
+            if (row[11] != null) {
+                if (row[11] instanceof java.time.Instant) {
+                    createdAt = (java.time.Instant) row[11];
+                } else if (row[11] instanceof java.sql.Timestamp) {
+                    createdAt = ((java.sql.Timestamp) row[11]).toInstant();
+                } else if (row[11] instanceof java.time.OffsetDateTime) {
+                    createdAt = ((java.time.OffsetDateTime) row[11]).toInstant();
                 }
             }
             
             DocumentChunk chunk = DocumentChunk.builder()
                 .id(id)
                 .userId(chunkUserId)
+                .chatId(chunkChatId)
                 .chunkIndex(chunkIndex)
                 .content(content)
                 .contentHash(contentHash)

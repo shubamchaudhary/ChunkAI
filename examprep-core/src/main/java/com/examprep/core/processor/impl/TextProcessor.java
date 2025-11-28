@@ -34,9 +34,10 @@ public class TextProcessor implements DocumentProcessor {
                 content.append(line).append("\n");
             }
             
+            String finalTitle = title != null ? title : "Untitled";
             return ExtractionResult.builder()
                 .pageContents(List.of(content.toString().trim()))
-                .pageTitles(List.of(title))
+                .pageTitles(List.of(finalTitle))
                 .totalPages(1)
                 .build();
         }

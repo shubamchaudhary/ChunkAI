@@ -25,6 +25,10 @@ public class QueryHistory {
     @JoinColumn(name = "user_id", nullable = false)
     private User user;
     
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "chat_id", nullable = false)
+    private Chat chat;
+    
     @Column(name = "query_text", nullable = false, columnDefinition = "TEXT")
     private String queryText;
     
