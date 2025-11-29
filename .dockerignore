@@ -1,0 +1,16 @@
+.git
+.gitignore
+README.md
+examprep-frontend
+node_modules
+.idea
+.vscode
+*.iml
+.gradle
+build
+examprep-api/build
+examprep-core/build
+examprep-data/build
+examprep-llm/build
+uploads
+

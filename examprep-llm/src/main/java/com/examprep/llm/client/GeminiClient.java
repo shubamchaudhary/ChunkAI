@@ -22,7 +22,18 @@ public class GeminiClient {
      * Generate embeddings for text using text-embedding-004
      */
     public float[] generateEmbedding(String text) {
-        if (config.getApiKey() == null || config.getApiKey().isEmpty()) {
+        return generateEmbedding(text, null);
+    }
+    
+    /**
+     * Generate embeddings for text using text-embedding-004 with optional API key
+     */
+    public float[] generateEmbedding(String text, String apiKey) {
+        String keyToUse = apiKey != null ? apiKey : 
+            (config.getApiKey() != null ? config.getApiKey() : 
+             (config.getAllApiKeys().isEmpty() ? null : config.getAllApiKeys().get(0)));
+        
+        if (keyToUse == null || keyToUse.isEmpty()) {
             throw new RuntimeException("Gemini API key is not set. Please set GEMINI_API_KEY environment variable or gemini.api-key in application.properties");
         }
         
@@ -30,12 +41,12 @@ public class GeminiClient {
             "%s/models/%s:embedContent?key=%s",
             config.getBaseUrl(),
             config.getEmbeddingModel(),
-            config.getApiKey()
+            keyToUse
         );
         
         log.debug("Generating embedding using URL: {} (API key length: {})", 
-            url.replace(config.getApiKey(), "***"), 
-            config.getApiKey().length());
+            url.replace(keyToUse, "***"), 
+            keyToUse.length());
         
         Map<String, Object> request = Map.of(
             "model", "models/" + config.getEmbeddingModel(),
@@ -74,7 +85,7 @@ public class GeminiClient {
      * Generate text using Gemini Flash
      */
     public String generateContent(String prompt, String systemInstruction) {
-        return generateContent(prompt, systemInstruction, false);
+        return generateContent(prompt, systemInstruction, false, null);
     }
     
     /**
@@ -84,11 +95,42 @@ public class GeminiClient {
      * @param useGoogleSearch If true, enables Google Search grounding for internet access
      */
     public String generateContent(String prompt, String systemInstruction, boolean useGoogleSearch) {
+        return generateContent(prompt, systemInstruction, useGoogleSearch, null);
+    }
+    
+    /**
+     * Generate text using Gemini Flash with optional Google Search grounding and specific API key
+     * @param prompt The user prompt
+     * @param systemInstruction The system instruction
+     * @param useGoogleSearch If true, enables Google Search grounding for internet access
+     * @param apiKey Optional API key to use (if null, uses default from config)
+     */
+    public String generateContent(String prompt, String systemInstruction, boolean useGoogleSearch, String apiKey) {
+        return generateContent(prompt, systemInstruction, useGoogleSearch, apiKey, null);
+    }
+    
+    /**
+     * Generate text using Gemini Flash with optional Google Search grounding, specific API key, and custom maxOutputTokens
+     * @param prompt The user prompt
+     * @param systemInstruction The system instruction
+     * @param useGoogleSearch If true, enables Google Search grounding for internet access
+     * @param apiKey Optional API key to use (if null, uses default from config)
+     * @param maxOutputTokens Optional max output tokens (if null, uses config default)
+     */
+    public String generateContent(String prompt, String systemInstruction, boolean useGoogleSearch, String apiKey, Integer maxOutputTokens) {
+        String keyToUse = apiKey != null ? apiKey : 
+            (config.getApiKey() != null ? config.getApiKey() : 
+             (config.getAllApiKeys().isEmpty() ? null : config.getAllApiKeys().get(0)));
+        
+        if (keyToUse == null || keyToUse.isEmpty()) {
+            throw new RuntimeException("Gemini API key is not set. Please set GEMINI_API_KEY environment variable or gemini.api-key in application.properties");
+        }
+        
         String url = String.format(
             "%s/models/%s:generateContent?key=%s",
             config.getBaseUrl(),
             config.getGenerationModel(),
-            config.getApiKey()
+            keyToUse
         );
         
         java.util.Map<String, Object> requestMap = new java.util.HashMap<>();
@@ -98,10 +140,11 @@ public class GeminiClient {
         requestMap.put("systemInstruction", Map.of(
             "parts", List.of(Map.of("text", systemInstruction))
         ));
+        int outputTokens = maxOutputTokens != null ? maxOutputTokens : config.getMaxOutputTokens();
         requestMap.put("generationConfig", Map.of(
             "temperature", 0.7,
             "topP", 0.95,
-            "maxOutputTokens", config.getMaxOutputTokens()  // Configurable max output tokens
+            "maxOutputTokens", outputTokens  // Configurable max output tokens
         ));
         
         // Enable Google Search grounding if requested
@@ -128,16 +171,47 @@ public class GeminiClient {
             }
             
             GenerationResponse.Candidate candidate = response.getCandidates().get(0);
+            
+            // Check finish reason first
+            String finishReason = candidate.getFinishReason();
+            if (finishReason != null) {
+                if (finishReason.equals("SAFETY")) {
+                    String safetyMessage = candidate.getFinishMessage() != null ? candidate.getFinishMessage() : "Content was blocked by safety filters";
+                    log.error("Gemini response blocked by safety filters: {}", safetyMessage);
+                    throw new RuntimeException("Content generation blocked by safety filters: " + safetyMessage);
+                } else if (finishReason.equals("RECITATION")) {
+                    log.error("Gemini response blocked due to recitation");
+                    throw new RuntimeException("Content generation blocked due to recitation concerns");
+                } else if (!finishReason.equals("STOP") && !finishReason.equals("MAX_TOKENS")) {
+                    log.warn("Gemini response finished with unexpected reason: {} (message: {})", 
+                        finishReason, candidate.getFinishMessage());
+                }
+            }
+            
+            // Check if content and parts exist
+            if (candidate.getContent() == null) {
+                throw new RuntimeException("Failed to generate content: candidate content is null. Finish reason: " + finishReason);
+            }
+            
+            if (candidate.getContent().getParts() == null || candidate.getContent().getParts().isEmpty()) {
+                String errorMsg = "Failed to generate content: no parts in response. Finish reason: " + finishReason;
+                if (candidate.getFinishMessage() != null) {
+                    errorMsg += ", Message: " + candidate.getFinishMessage();
+                }
+                log.error(errorMsg);
+                throw new RuntimeException(errorMsg);
+            }
+            
             String text = candidate.getContent().getParts().get(0).getText();
             
+            if (text == null || text.isEmpty()) {
+                throw new RuntimeException("Failed to generate content: text is null or empty. Finish reason: " + finishReason);
+            }
+            
             // Check if response was truncated
-            String finishReason = candidate.getFinishReason();
-            if (finishReason != null && !finishReason.equals("STOP")) {
-                log.warn("Gemini response finished with reason: {} (message: {}). Response may be truncated.", 
-                    finishReason, candidate.getFinishMessage());
-                if (finishReason.equals("MAX_TOKENS")) {
-                    log.error("Response was truncated due to MAX_TOKENS limit. Consider increasing maxOutputTokens.");
-                }
+            if (finishReason != null && finishReason.equals("MAX_TOKENS")) {
+                log.warn("Gemini response was truncated due to MAX_TOKENS limit. Response length: {}. Consider increasing maxOutputTokens.", 
+                    text.length());
             }
             
             log.debug("Generated content length: {} characters. Finish reason: {}. Google Search: {}", 
@@ -147,7 +221,7 @@ public class GeminiClient {
         } catch (org.springframework.web.reactive.function.client.WebClientResponseException e) {
             log.error("Gemini API error: Status={}, URL={}, Response={}", 
                 e.getStatusCode(), 
-                url.replace(config.getApiKey(), "***"), 
+                url.replace(keyToUse, "***"), 
                 e.getResponseBodyAsString());
             if (e.getStatusCode().value() == 404) {
                 throw new RuntimeException(
