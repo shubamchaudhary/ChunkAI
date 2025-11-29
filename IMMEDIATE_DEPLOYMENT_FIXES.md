@@ -113,7 +113,7 @@ Added font packages to Dockerfile runtime stage:
 RUN apk update && \
     apk add --no-cache \
     fontconfig \
-    fonts-liberation \
+    ttf-liberation \
     ttf-dejavu \
     ttf-droid \
     ttf-freefont \
@@ -122,10 +122,12 @@ RUN apk update && \
 
 **Fonts Installed**:
 - `fontconfig`: Font configuration system
-- `fonts-liberation`: Liberation fonts (replaces proprietary fonts)
+- `ttf-liberation`: Liberation fonts (replaces proprietary fonts) - **Alpine package name**
 - `ttf-dejavu`: DejaVu fonts (sans-serif, serif, monospace)
 - `ttf-droid`: Droid font family
 - `ttf-freefont`: FreeFont family
+
+**Note**: Using Alpine Linux package names (`ttf-*` prefix) instead of Debian/Ubuntu names (`fonts-*` prefix).
 
 **Font Cache**:
 - Runs `fc-cache -f -v` to build font cache

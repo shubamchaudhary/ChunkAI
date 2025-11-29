@@ -13,7 +13,7 @@ WORKDIR /app
 RUN apk update && \
     apk add --no-cache \
     fontconfig \
-    fonts-liberation \
+    ttf-liberation \
     ttf-dejavu \
     ttf-droid \
     ttf-freefont \
