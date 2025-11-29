@@ -4,16 +4,61 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080
 
 const api = axios.create({
   baseURL: API_BASE_URL,
+  timeout: 30000, // 30 second timeout
+  withCredentials: false, // Important: Set to false for CORS
+  headers: {
+    'Content-Type': 'application/json',
+  },
 });
 
-// Add token to requests
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('token');
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`;
+// Request interceptor - Add token to requests
+api.interceptors.request.use(
+  (config) => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    // Log request for debugging (remove in production)
+    console.log(`[API Request] ${config.method?.toUpperCase()} ${config.baseURL}${config.url}`);
+    return config;
+  },
+  (error) => {
+    console.error('[API Request Error]', error);
+    return Promise.reject(error);
   }
-  return config;
-});
+);
+
+// Response interceptor - Better error handling
+api.interceptors.response.use(
+  (response) => {
+    return response;
+  },
+  (error) => {
+    // Log detailed error information
+    if (error.response) {
+      // Server responded with error status
+      console.error('[API Error Response]', {
+        status: error.response.status,
+        statusText: error.response.statusText,
+        data: error.response.data,
+        url: error.config?.url,
+        baseURL: error.config?.baseURL,
+      });
+    } else if (error.request) {
+      // Request made but no response received (network error, backend down, etc.)
+      console.error('[API Network Error]', {
+        message: error.message,
+        url: error.config?.url,
+        baseURL: error.config?.baseURL,
+        code: error.code,
+      });
+    } else {
+      // Error in request setup
+      console.error('[API Request Setup Error]', error.message);
+    }
+    return Promise.reject(error);
+  }
+);
 
 // Auth API
 export const authAPI = {

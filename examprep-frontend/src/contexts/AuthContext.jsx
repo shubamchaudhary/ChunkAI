@@ -46,7 +46,45 @@ export const AuthProvider = ({ children }) => {
       setUser({ userId, email: userEmail, token });
       return { success: true };
     } catch (error) {
-      return { success: false, error: error.response?.data?.message || 'Registration failed' };
+      // Better error handling - show detailed error information
+      let errorMessage = 'Registration failed';
+      
+      if (error.response) {
+        // Server responded with error
+        const status = error.response.status;
+        if (status === 403) {
+          errorMessage = 'Access forbidden. Please check CORS configuration and backend is running.';
+        } else if (status === 401) {
+          errorMessage = 'Authentication failed. Please check your credentials.';
+        } else if (status === 400) {
+          errorMessage = error.response.data?.message || 'Invalid request. Please check your input.';
+        } else if (status >= 500) {
+          errorMessage = 'Server error. Please try again later.';
+        } else {
+          errorMessage = error.response.data?.message || `Error: ${status} ${error.response.statusText}`;
+        }
+      } else if (error.request) {
+        // Request made but no response (network error, backend down, etc.)
+        if (error.code === 'ERR_NETWORK' || error.code === 'ECONNREFUSED') {
+          errorMessage = 'Cannot connect to server. Please check if backend is running.';
+        } else if (error.code === 'ETIMEDOUT' || error.message.includes('timeout')) {
+          errorMessage = 'Connection timeout. Server may be slow or unreachable.';
+        } else {
+          errorMessage = `Network error: ${error.message || 'Cannot reach server'}`;
+        }
+      } else {
+        errorMessage = error.message || 'An unexpected error occurred';
+      }
+      
+      console.error('Registration error details:', {
+        message: error.message,
+        code: error.code,
+        response: error.response?.data,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+      });
+      
+      return { success: false, error: errorMessage };
     }
   };
 
