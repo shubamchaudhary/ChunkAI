@@ -18,7 +18,7 @@ public class EmbeddingService {
     private final ApiKeyManager apiKeyManager;
     
     // Rate limiting: add delay between embedding requests to avoid API limits
-    private static final long EMBEDDING_DELAY_MS = 500; // 500ms delay between requests (5 requests per second max)
+    private static final long EMBEDDING_DELAY_MS = 300; // 300ms delay between requests (~3 requests per second max)
     private static long lastEmbeddingTime = 0;
     private static final Object embeddingLock = new Object();
     

@@ -14,7 +14,6 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -36,10 +35,10 @@ public class ProcessingJobWorker {
     
     private static final String WORKER_ID = "worker-" + UUID.randomUUID().toString().substring(0, 8);
     private static final int LOCK_DURATION_SECONDS = 300; // 5 minutes
-    private static final int BATCH_SIZE = 3; // Process only 3 jobs in parallel to avoid overwhelming Gemini API
+    private static final int BATCH_SIZE = 5; // Process 5 jobs in parallel (balanced for speed vs rate limits)
     private static final ExecutorService executorService = Executors.newFixedThreadPool(BATCH_SIZE);
     
-    @Scheduled(fixedDelay = 5000) // Run every 5 seconds to avoid overwhelming the system
+    @Scheduled(fixedDelay = 3000) // Run every 3 seconds
     @Transactional // Required for repository queries with @Lock
     public void processQueuedJobs() {
         try {
@@ -61,25 +60,10 @@ public class ProcessingJobWorker {
                 .map(ProcessingJob::getId)
                 .collect(Collectors.toList());
             
-            // Stagger job processing to avoid overwhelming API - start jobs with delays
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-            for (int i = 0; i < jobIds.size(); i++) {
-                final UUID jobId = jobIds.get(i);
-                // Stagger: wait 2 seconds before starting each new job
-                final int delayMs = i * 2000;
-                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                    if (delayMs > 0) {
-                        try {
-                            Thread.sleep(delayMs);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            log.warn("Interrupted while waiting to start job {}", jobId);
-                        }
-                    }
-                    processJobById(jobId);
-                }, executorService);
-                futures.add(future);
-            }
+            // Process jobs in parallel without stagger (rate limiting handles API limits)
+            List<CompletableFuture<Void>> futures = jobIds.stream()
+                .map(jobId -> CompletableFuture.runAsync(() -> processJobById(jobId), executorService))
+                .collect(Collectors.toList());
             
             // Wait for all to complete (but don't block the scheduler)
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
@@ -101,79 +85,90 @@ public class ProcessingJobWorker {
         processJob(job);
     }
     
-    @Transactional(propagation = Propagation.REQUIRES_NEW) // Each job needs its own transaction
+    /**
+     * Process job - split transaction boundaries to avoid connection leaks
+     * API calls are outside transactions
+     */
     private void processJob(ProcessingJob job) {
         UUID jobId = job.getId();
         UUID documentId = null;
         try {
-            // Load job and document within transaction to avoid lazy loading issues
-            ProcessingJob managedJob = jobRepository.findById(jobId)
-                .orElseThrow(() -> new RuntimeException("Job not found: " + jobId));
+            // Lock job in transaction
+            documentId = lockJob(jobId);
+            final UUID finalDocumentId = documentId;
             
-            // Get document ID before async processing
-            documentId = managedJob.getDocument().getId();
-            final UUID finalDocumentId = documentId; // Make effectively final for lambda
+            log.info("Processing job {} for document {}", jobId, finalDocumentId);
             
-            // Lock the job
-            managedJob.setStatus("PROCESSING");
-            managedJob.setLockedBy(WORKER_ID);
-            managedJob.setLockedUntil(Instant.now().plusSeconds(LOCK_DURATION_SECONDS));
-            managedJob.setStartedAt(Instant.now());
-            managedJob.setAttempts(managedJob.getAttempts() + 1);
-            jobRepository.save(managedJob);
-            
-            log.info("Processing job {} for document {}", managedJob.getId(), finalDocumentId);
-            
-            // Process the document
+            // Process the document OUTSIDE transaction (contains long-running API calls)
             documentProcessingService.processDocument(finalDocumentId);
             
-            // Reload job within transaction
-            ProcessingJob completedJob = jobRepository.findById(jobId)
-                .orElseThrow(() -> new RuntimeException("Job not found: " + jobId));
+            // Mark job as completed in transaction
+            markJobCompleted(jobId);
             
-            // Mark job as completed
-            completedJob.setStatus("COMPLETED");
-            completedJob.setCompletedAt(Instant.now());
-            completedJob.setLockedUntil(null);
-            completedJob.setLockedBy(null);
-            jobRepository.save(completedJob);
-            
-            log.info("Completed processing job {} for document {}", completedJob.getId(), finalDocumentId);
+            log.info("Completed processing job {} for document {}", jobId, finalDocumentId);
             
         } catch (Exception e) {
             log.error("Error processing job {}: {}", jobId, e.getMessage(), e);
+            handleJobFailure(jobId, documentId, e);
+        }
+    }
+    
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    private UUID lockJob(UUID jobId) {
+        ProcessingJob managedJob = jobRepository.findById(jobId)
+            .orElseThrow(() -> new RuntimeException("Job not found: " + jobId));
+        
+        UUID documentId = managedJob.getDocument().getId();
+        
+        managedJob.setStatus("PROCESSING");
+        managedJob.setLockedBy(WORKER_ID);
+        managedJob.setLockedUntil(Instant.now().plusSeconds(LOCK_DURATION_SECONDS));
+        managedJob.setStartedAt(Instant.now());
+        managedJob.setAttempts(managedJob.getAttempts() + 1);
+        jobRepository.save(managedJob);
+        
+        return documentId;
+    }
+    
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    private void markJobCompleted(UUID jobId) {
+        ProcessingJob completedJob = jobRepository.findById(jobId)
+            .orElseThrow(() -> new RuntimeException("Job not found: " + jobId));
+        
+        completedJob.setStatus("COMPLETED");
+        completedJob.setCompletedAt(Instant.now());
+        completedJob.setLockedUntil(null);
+        completedJob.setLockedBy(null);
+        jobRepository.save(completedJob);
+    }
+    
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    private void handleJobFailure(UUID jobId, UUID documentId, Exception e) {
+        try {
+            ProcessingJob failedJob = jobRepository.findById(jobId)
+                .orElseThrow(() -> new RuntimeException("Job not found: " + jobId));
             
-            try {
-                // Reload job within transaction for error handling
-                ProcessingJob failedJob = jobRepository.findById(jobId)
-                    .orElseThrow(() -> new RuntimeException("Job not found: " + jobId));
+            if (failedJob.getAttempts() >= failedJob.getMaxAttempts()) {
+                failedJob.setStatus("FAILED");
+                failedJob.setLastError(e.getMessage());
+                failedJob.setCompletedAt(Instant.now());
                 
-                // Handle retry logic
-                if (failedJob.getAttempts() >= failedJob.getMaxAttempts()) {
-                    failedJob.setStatus("FAILED");
-                    failedJob.setLastError(e.getMessage());
-                    failedJob.setCompletedAt(Instant.now());
-                    
-                    // Mark document as failed - reload document within transaction
-                    if (documentId != null) {
-                        final UUID finalDocumentId = documentId; // Make effectively final for lambda
-                        Document document = documentRepository.findById(finalDocumentId)
-                            .orElseThrow(() -> new RuntimeException("Document not found: " + finalDocumentId));
-                        document.setProcessingStatus(ProcessingStatus.FAILED);
-                        document.setErrorMessage("Processing failed after " + failedJob.getAttempts() + " attempts: " + e.getMessage());
-                        documentRepository.save(document);
-                    }
-                } else {
-                    // Retry - unlock and requeue
-                    failedJob.setStatus("QUEUED");
-                    failedJob.setLastError(e.getMessage());
-                    failedJob.setLockedUntil(null);
-                    failedJob.setLockedBy(null);
+                if (documentId != null) {
+                    Document document = documentRepository.findById(documentId)
+                        .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
+                    document.setProcessingStatus(ProcessingStatus.FAILED);
+                    document.setErrorMessage("Processing failed after " + failedJob.getAttempts() + " attempts: " + e.getMessage());
+                    documentRepository.save(document);
                 }
-                jobRepository.save(failedJob);
-            } catch (Exception ex) {
-                log.error("Error updating job status after failure", ex);
+            } else {
+                failedJob.setStatus("QUEUED");
+                failedJob.setLastError(e.getMessage());
+                failedJob.setLockedUntil(null);
+                failedJob.setLockedBy(null);
             }
+            jobRepository.save(failedJob);
+        } catch (Exception ex) {
+            log.error("Error updating job status after failure", ex);
         }
     }
 }

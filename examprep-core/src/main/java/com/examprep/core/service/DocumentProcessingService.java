@@ -18,6 +18,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.io.InputStream;
 import java.security.MessageDigest;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -33,22 +34,16 @@ public class DocumentProcessingService {
     private final EmbeddingService embeddingService;
     private final FileStorageService fileStorageService;
     
-    @Transactional
+    /**
+     * Process document - split into transaction boundaries to avoid connection leaks
+     * API calls are outside transactions to prevent holding DB connections during long operations
+     */
     public void processDocument(UUID documentId) {
-        Document document = documentRepository.findById(documentId)
-            .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
+        // Initialize document status in transaction
+        Document document = initializeProcessing(documentId);
         
         try {
             log.info("Starting processing for document: {}", document.getFileName());
-            
-            // Delete existing chunks if reprocessing (prevents duplicate key violations)
-            chunkRepository.deleteByDocumentId(documentId);
-            log.debug("Deleted existing chunks for document: {}", documentId);
-            
-            // Update status to PROCESSING
-            document.setProcessingStatus(ProcessingStatus.PROCESSING);
-            document.setProcessingStartedAt(java.time.Instant.now());
-            documentRepository.save(document);
             
             // Get processor for file type
             DocumentProcessor processor = processorFactory.getProcessor(document.getFileType());
@@ -65,22 +60,24 @@ public class DocumentProcessingService {
             
             fileStream.close();
             
-            document.setTotalPages(extractionResult.getTotalPages());
-            
-            // Chunk the content
+            // Chunk the content (no DB operations)
             List<ChunkingResult> chunks = chunkingService.chunkByPages(
                 extractionResult.getPageContents(),
                 extractionResult.getPageTitles()
             );
             
-            // Generate embeddings and save chunks
+            // Generate embeddings OUTSIDE transaction (API calls can take minutes)
+            List<DocumentChunk> documentChunks = new java.util.ArrayList<>();
+            UUID userId = document.getUser().getId();
+            UUID chatId = document.getChat().getId();
+            
             for (ChunkingResult chunk : chunks) {
                 float[] embedding = embeddingService.generateEmbedding(chunk.getContent());
                 
                 DocumentChunk documentChunk = DocumentChunk.builder()
                     .document(document)
-                    .userId(document.getUser().getId())
-                    .chatId(document.getChat().getId())
+                    .userId(userId)
+                    .chatId(chatId)
                     .chunkIndex(chunk.getChunkIndex())
                     .content(chunk.getContent())
                     .contentHash(computeHash(chunk.getContent()))
@@ -91,25 +88,62 @@ public class DocumentProcessingService {
                     .tokenCount(chunk.getTokenCount())
                     .build();
                 
-                chunkRepository.save(documentChunk);
+                documentChunks.add(documentChunk);
             }
             
-            // Update document status
-            document.setTotalChunks(chunks.size());
-            document.setProcessingStatus(ProcessingStatus.COMPLETED);
-            document.setProcessingCompletedAt(java.time.Instant.now());
-            documentRepository.save(document);
+            // Save all chunks in a single transaction (batch save)
+            saveChunksAndComplete(documentId, documentChunks, extractionResult.getTotalPages());
             
             log.info("Completed processing for document: {} - {} chunks created", 
                 document.getFileName(), chunks.size());
             
         } catch (Exception e) {
             log.error("Error processing document: {}", documentId, e);
-            document.setProcessingStatus(ProcessingStatus.FAILED);
-            document.setErrorMessage(e.getMessage());
-            documentRepository.save(document);
+            markAsFailed(documentId, e.getMessage());
             throw new RuntimeException("Failed to process document", e);
         }
+    }
+    
+    @Transactional
+    private Document initializeProcessing(UUID documentId) {
+        Document document = documentRepository.findById(documentId)
+            .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
+        
+        // Delete existing chunks if reprocessing
+        chunkRepository.deleteByDocumentId(documentId);
+        log.debug("Deleted existing chunks for document: {}", documentId);
+        
+        // Update status to PROCESSING
+        document.setProcessingStatus(ProcessingStatus.PROCESSING);
+        document.setProcessingStartedAt(java.time.Instant.now());
+        documentRepository.save(document);
+        
+        return document;
+    }
+    
+    @Transactional
+    private void saveChunksAndComplete(UUID documentId, List<DocumentChunk> chunks, int totalPages) {
+        Document document = documentRepository.findById(documentId)
+            .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
+        
+        // Batch save all chunks
+        chunkRepository.saveAll(chunks);
+        
+        // Update document status
+        document.setTotalPages(totalPages);
+        document.setTotalChunks(chunks.size());
+        document.setProcessingStatus(ProcessingStatus.COMPLETED);
+        document.setProcessingCompletedAt(java.time.Instant.now());
+        documentRepository.save(document);
+    }
+    
+    @Transactional
+    private void markAsFailed(UUID documentId, String errorMessage) {
+        Document document = documentRepository.findById(documentId)
+            .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
+        document.setProcessingStatus(ProcessingStatus.FAILED);
+        document.setErrorMessage(errorMessage);
+        documentRepository.save(document);
     }
     
     private String computeHash(String content) {
