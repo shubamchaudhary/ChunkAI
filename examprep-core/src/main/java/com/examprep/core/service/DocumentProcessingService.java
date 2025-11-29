@@ -5,22 +5,30 @@ import com.examprep.core.model.ChunkingResult;
 import com.examprep.core.model.ExtractionResult;
 import com.examprep.core.processor.DocumentProcessor;
 import com.examprep.core.processor.DocumentProcessorFactory;
-import com.examprep.core.service.FileStorageService;
 import com.examprep.data.entity.Document;
 import com.examprep.data.entity.DocumentChunk;
 import com.examprep.data.repository.DocumentChunkRepository;
 import com.examprep.data.repository.DocumentRepository;
-import com.examprep.llm.service.EmbeddingService;
+import com.examprep.core.service.FileStorageService;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.security.MessageDigest;
 import java.util.List;
 import java.util.UUID;
 
+/**
+ * Document processing service - NO summaries, NO embeddings during ingestion.
+ * Only extracts text, chunks it, and saves chunks without embeddings.
+ * Embeddings are generated later by BatchEmbeddingJob.
+ */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -30,87 +38,245 @@ public class DocumentProcessingService {
     private final DocumentChunkRepository chunkRepository;
     private final DocumentProcessorFactory processorFactory;
     private final ChunkingService chunkingService;
-    private final EmbeddingService embeddingService;
     private final FileStorageService fileStorageService;
     
-    @Transactional
+    @PersistenceContext
+    private EntityManager entityManager;
+    
+    /**
+     * Process document - extract, chunk, and save (NO embeddings, NO summaries).
+     * Fast processing - only file I/O and database operations.
+     */
     public void processDocument(UUID documentId) {
-        Document document = documentRepository.findById(documentId)
-            .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
+        long startTime = System.currentTimeMillis();
+        String processId = "doc-" + documentId.toString().substring(0, 8) + "-" + System.currentTimeMillis();
+        
+        log.info("[DOC_PROCESS] Starting document processing (no embeddings) | processId={} | documentId={}", 
+            processId, documentId);
+        
+        Document document = initializeProcessing(documentId);
+        
+        log.info("[DOC_PROCESS] Document loaded | processId={} | fileName={} | fileType={} | fileSizeBytes={}", 
+            processId, document.getFileName(), document.getFileType(), document.getFileSizeBytes());
         
         try {
-            log.info("Starting processing for document: {}", document.getFileName());
+            // Phase 1: Extract text from document
+            long extractStartTime = System.currentTimeMillis();
+            ExtractionResult extractionResult = extractText(document);
+            long extractDuration = System.currentTimeMillis() - extractStartTime;
             
-            // Delete existing chunks if reprocessing (prevents duplicate key violations)
-            chunkRepository.deleteByDocumentId(documentId);
-            log.debug("Deleted existing chunks for document: {}", documentId);
+            log.info("[DOC_PROCESS] Text extraction completed | processId={} | totalPages={} | textLength={} | durationMs={}", 
+                processId, extractionResult.getTotalPages(), 
+                String.join("\n\n", extractionResult.getPageContents()).length(), extractDuration);
             
-            // Update status to PROCESSING
-            document.setProcessingStatus(ProcessingStatus.PROCESSING);
-            document.setProcessingStartedAt(java.time.Instant.now());
-            documentRepository.save(document);
-            
-            // Get processor for file type
-            DocumentProcessor processor = processorFactory.getProcessor(document.getFileType());
-            
-            // Load file from storage
-            if (!fileStorageService.fileExists(document.getId())) {
-                throw new RuntimeException("File not found in storage for document: " + document.getId());
-            }
-            
-            InputStream fileStream = fileStorageService.getFile(document.getId());
-            
-            // Extract text from file
-            ExtractionResult extractionResult = processor.extract(fileStream, document.getFileType());
-            
-            fileStream.close();
-            
-            document.setTotalPages(extractionResult.getTotalPages());
-            
-            // Chunk the content
+            // Phase 2: Chunk the extracted text
+            long chunkStartTime = System.currentTimeMillis();
             List<ChunkingResult> chunks = chunkingService.chunkByPages(
                 extractionResult.getPageContents(),
                 extractionResult.getPageTitles()
             );
+            long chunkDuration = System.currentTimeMillis() - chunkStartTime;
             
-            // Generate embeddings and save chunks
-            for (ChunkingResult chunk : chunks) {
-                float[] embedding = embeddingService.generateEmbedding(chunk.getContent());
-                
-                DocumentChunk documentChunk = DocumentChunk.builder()
-                    .document(document)
-                    .userId(document.getUser().getId())
-                    .chatId(document.getChat().getId())
-                    .chunkIndex(chunk.getChunkIndex())
-                    .content(chunk.getContent())
-                    .contentHash(computeHash(chunk.getContent()))
-                    .pageNumber(chunk.getPageNumber())
-                    .slideNumber(chunk.getSlideNumber())
-                    .sectionTitle(chunk.getSectionTitle())
-                    .embedding(embedding)
-                    .tokenCount(chunk.getTokenCount())
-                    .build();
-                
-                chunkRepository.save(documentChunk);
-            }
+            log.info("[DOC_PROCESS] Chunking completed | processId={} | chunksCreated={} | durationMs={}", 
+                processId, chunks.size(), chunkDuration);
             
-            // Update document status
-            document.setTotalChunks(chunks.size());
-            document.setProcessingStatus(ProcessingStatus.COMPLETED);
-            document.setProcessingCompletedAt(java.time.Instant.now());
-            documentRepository.save(document);
+            // Phase 3: Save chunks WITHOUT embeddings (embeddings will be generated by BatchEmbeddingJob)
+            long saveStartTime = System.currentTimeMillis();
+            saveChunksWithoutEmbeddings(documentId, document, chunks);
+            long saveDuration = System.currentTimeMillis() - saveStartTime;
             
-            log.info("Completed processing for document: {} - {} chunks created", 
-                document.getFileName(), chunks.size());
+            log.info("[DOC_PROCESS] Chunks saved (no embeddings) | processId={} | chunksSaved={} | durationMs={}", 
+                processId, chunks.size(), saveDuration);
+            
+            // Phase 4: Mark document as CHUNKED (ready for keyword search, embeddings will be added later)
+            long finalizeStartTime = System.currentTimeMillis();
+            markDocumentAsChunked(documentId, extractionResult.getTotalPages(), chunks.size());
+            long finalizeDuration = System.currentTimeMillis() - finalizeStartTime;
+            
+            long totalDuration = System.currentTimeMillis() - startTime;
+            
+            log.info("[DOC_PROCESS] Document processing completed | processId={} | documentId={} | fileName={} | totalDurationMs={} | extract={} | chunk={} | save={} | finalize={} | chunksCreated={}", 
+                processId, documentId, document.getFileName(), totalDuration,
+                extractDuration, chunkDuration, saveDuration, finalizeDuration, chunks.size());
             
         } catch (Exception e) {
-            log.error("Error processing document: {}", documentId, e);
-            document.setProcessingStatus(ProcessingStatus.FAILED);
-            document.setErrorMessage(e.getMessage());
-            documentRepository.save(document);
+            long duration = System.currentTimeMillis() - startTime;
+            log.error("[DOC_PROCESS] Document processing failed | processId={} | documentId={} | fileName={} | durationMs={} | error={}", 
+                processId, documentId, document.getFileName(), duration, e.getMessage(), e);
+            markDocumentAsFailed(documentId, e.getMessage());
             throw new RuntimeException("Failed to process document", e);
         }
     }
+    
+    /**
+     * Initialize processing - loads document and deletes old chunks.
+     */
+    private Document initializeProcessing(UUID documentId) {
+        Document document = documentRepository.findByIdExcludingEmbedding(documentId)
+            .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
+        
+        // Delete existing chunks if reprocessing
+        chunkRepository.deleteByDocumentId(documentId);
+        log.debug("Deleted existing chunks for document: {}", documentId);
+        
+        // Update status to PROCESSING and tier to EXTRACTING
+        java.time.Instant startedAt = java.time.Instant.now();
+        documentRepository.updateProcessingStatus(
+            documentId,
+            ProcessingStatus.PROCESSING.name(),
+            startedAt,
+            null, null, null, null
+        );
+        
+        // Update processing tier to EXTRACTING
+        documentRepository.updateDocumentProgress(
+            documentId,
+            "EXTRACTING",
+            0,
+            0
+        );
+        
+        return document;
+    }
+    
+    /**
+     * Extract text from document file.
+     */
+    private ExtractionResult extractText(Document document) {
+        DocumentProcessor processor = processorFactory.getProcessor(document.getFileType());
+        
+        // Load file from storage
+        if (!fileStorageService.fileExists(document.getId())) {
+            throw new RuntimeException("File not found in storage for document: " + document.getId());
+        }
+        
+        InputStream fileStream = null;
+        try {
+            fileStream = fileStorageService.getFile(document.getId());
+            
+            // Extract text from file
+            ExtractionResult extractionResult = processor.extract(fileStream, document.getFileType());
+            
+            return extractionResult;
+            
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to read or process file for document: " + document.getId(), e);
+        } finally {
+            if (fileStream != null) {
+                try {
+                    fileStream.close();
+                } catch (IOException e) {
+                    log.warn("Failed to close file stream for document: {}", document.getId(), e);
+                }
+            }
+        }
+    }
+    
+    /**
+     * Save chunks WITHOUT embeddings.
+     * Embeddings will be generated later by BatchEmbeddingJob.
+     */
+    private void saveChunksWithoutEmbeddings(
+        UUID documentId,
+        Document document,
+        List<ChunkingResult> chunks
+    ) {
+        log.info("[DOC_PROCESS] Saving {} chunks without embeddings | documentId={}", 
+            chunks.size(), documentId);
+        
+        for (ChunkingResult chunk : chunks) {
+            saveChunkInTransaction(documentId, document, chunk, null); // null embedding
+        }
+        
+        log.info("[DOC_PROCESS] All chunks saved (no embeddings) | documentId={} | totalChunks={}", 
+            documentId, chunks.size());
+    }
+    
+    /**
+     * Save a single chunk in a short transaction (embedding can be null).
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    private void saveChunkInTransaction(
+        UUID documentId,
+        Document document,
+        ChunkingResult chunk,
+        float[] embedding  // Can be null
+    ) {
+        // Extract key terms (for keyword search)
+        String[] keyTerms = extractKeyTerms(chunk.getContent());
+        
+        DocumentChunk documentChunk = DocumentChunk.builder()
+            .document(document)
+            .userId(document.getUser().getId())
+            .chatId(document.getChat().getId())
+            .chunkIndex(chunk.getChunkIndex())
+            .content(chunk.getContent())
+            .contentHash(computeHash(chunk.getContent()))
+            .pageNumber(chunk.getPageNumber())
+            .slideNumber(chunk.getSlideNumber())
+            .sectionTitle(chunk.getSectionTitle())
+            .chunkType(determineChunkType(chunk.getContent()))
+            .keyTerms(keyTerms)
+            .embedding(embedding) // NULL - will be set by BatchEmbeddingJob
+            .tokenCount(chunk.getTokenCount())
+            .build();
+        
+        chunkRepository.save(documentChunk);
+    }
+    
+    /**
+     * Mark document as CHUNKED (ready for keyword search, embeddings pending).
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    private void markDocumentAsChunked(UUID documentId, Integer totalPages, int chunkCount) {
+        // Update processing tier to CHUNKED (keyword search available)
+        documentRepository.updateDocumentProgress(
+            documentId,
+            "CHUNKED",
+            0, // No embeddings yet
+            chunkCount
+        );
+        
+        // Update processing status (still PROCESSING until embeddings complete)
+        documentRepository.updateProcessingStatus(
+            documentId,
+            ProcessingStatus.PROCESSING.name(), // Still processing (embeddings pending)
+            null,
+            null,
+            null,
+            totalPages,
+            chunkCount
+        );
+        
+        log.info("[DOC_PROCESS] Document marked as CHUNKED | documentId={} | totalChunks={} | keywordSearchAvailable=true | vectorSearchAvailable=false", 
+            documentId, chunkCount);
+    }
+    
+    /**
+     * Mark document as failed in a short transaction.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    private void markDocumentAsFailed(UUID documentId, String errorMessage) {
+        documentRepository.updateProcessingStatus(
+            documentId,
+            ProcessingStatus.FAILED.name(),
+            null,
+            java.time.Instant.now(),
+            errorMessage,
+            null,
+            null
+        );
+        
+        // Also update processing tier
+        documentRepository.updateDocumentProgress(
+            documentId,
+            "FAILED",
+            0,
+            0
+        );
+    }
+    
+    // Helper methods
     
     private String computeHash(String content) {
         try {
@@ -125,5 +291,37 @@ public class DocumentProcessingService {
             return null;
         }
     }
+    
+    private String[] extractKeyTerms(String content) {
+        List<String> stopWords = List.of("the", "and", "for", "are", "but", "not", "you", "all", "can", "her", "was", "one", "our", "out", "day", "get", "has", "him", "his", "how", "man", "new", "now", "old", "see", "two", "way", "who", "boy", "did", "its", "let", "put", "say", "she", "too", "use");
+        
+        String[] words = content.toLowerCase()
+            .replaceAll("[^a-z0-9\\s]", " ")
+            .split("\\s+");
+        
+        return java.util.Arrays.stream(words)
+            .filter(w -> w.length() > 4)
+            .filter(w -> !stopWords.contains(w))
+            .distinct()
+            .limit(10)
+            .toArray(String[]::new);
+    }
+    
+    private String determineChunkType(String content) {
+        String lower = content.toLowerCase().trim();
+        
+        if (lower.length() < 100 && !lower.contains(".") && !lower.contains(",")) {
+            return "heading";
+        }
+        if (lower.contains("```") || lower.contains("public class") || lower.contains("function")) {
+            return "code";
+        }
+        if (lower.contains("|") && lower.split("\\|").length > 3) {
+            return "table";
+        }
+        if (lower.startsWith("*") || lower.startsWith("-") || lower.startsWith("1.")) {
+            return "list";
+        }
+        return "paragraph";
+    }
 }
-

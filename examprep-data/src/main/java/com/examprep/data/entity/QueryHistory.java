@@ -57,6 +57,11 @@ public class QueryHistory {
     @Column(name = "chunks_retrieved")
     private Integer chunksRetrieved;
     
+    // v2.0: Track LLM calls used
+    @Column(name = "llm_calls_used")
+    @Builder.Default
+    private Integer llmCallsUsed = 1;
+    
     @CreationTimestamp
     @Column(name = "created_at")
     private Instant createdAt;

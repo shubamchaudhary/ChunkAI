@@ -16,7 +16,7 @@ import java.util.UUID;
 @Repository
 public interface ProcessingJobRepository extends JpaRepository<ProcessingJob, UUID> {
     
-    Optional<ProcessingJob> findByDocumentId(UUID documentId);
+    Optional<ProcessingJob> findByDocument_Id(UUID documentId);
     
     List<ProcessingJob> findByStatus(String status);
     

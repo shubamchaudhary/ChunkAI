@@ -54,8 +54,28 @@ public class DocumentChunk {
     @Column(name = "token_count")
     private Integer tokenCount;
     
+    // v2.0: Chunk-level metadata
+    @Column(name = "chunk_type")
+    private String chunkType; // "heading", "paragraph", "code", "table", "list"
+    
+    @Column(name = "key_terms", columnDefinition = "TEXT[]")
+    private String[] keyTerms; // Extracted important terms for keyword search
+    
     @CreationTimestamp
     @Column(name = "created_at")
     private Instant createdAt;
+    
+    // Transient field for similarity score (used in retrieval)
+    @Transient
+    private Double score;
+    
+    // Helper method to get fileName
+    public String getFileName() {
+        return document != null ? document.getFileName() : null;
+    }
+    
+    public UUID getDocumentId() {
+        return document != null ? document.getId() : null;
+    }
 }
 

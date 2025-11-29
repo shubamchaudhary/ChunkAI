@@ -16,6 +16,7 @@ import com.examprep.data.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -28,6 +29,8 @@ import org.springframework.web.multipart.MultipartFile;
 import jakarta.servlet.http.HttpServletRequest;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -168,8 +171,13 @@ public class DocumentController {
         
         Page<Document> documents;
         if (chatId != null) {
-            // Chat-scoped documents
-            documents = documentRepository.findByChatId(chatId, pageable);
+            // Chat-scoped documents - use custom method to avoid vector type issues
+            List<Document> docList = documentRepository.findByChatIdExcludingEmbedding(chatId);
+            // Manually paginate the list
+            int start = (int) pageable.getOffset();
+            int end = Math.min(start + pageable.getPageSize(), docList.size());
+            List<Document> pagedList = start < docList.size() ? docList.subList(start, end) : new ArrayList<>();
+            documents = new org.springframework.data.domain.PageImpl<>(pagedList, pageable, docList.size());
         } else if (status != null) {
             documents = documentRepository.findByUserIdAndProcessingStatus(userId, status, pageable);
         } else {
@@ -199,7 +207,8 @@ public class DocumentController {
     ) {
         UUID userId = UUID.fromString(authentication.getName());
         
-        Document document = documentRepository.findById(documentId)
+        // Use custom method to avoid loading summary_embedding column
+        Document document = documentRepository.findByIdExcludingEmbedding(documentId)
             .orElse(null);
         
         if (document == null || !document.getUser().getId().equals(userId)) {

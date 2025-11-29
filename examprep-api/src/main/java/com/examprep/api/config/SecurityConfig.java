@@ -1,7 +1,7 @@
 package com.examprep.api.config;
 
-import com.examprep.api.security.JwtAuthenticationFilter;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.authentication.AuthenticationManager;
@@ -25,7 +25,11 @@ import java.util.List;
 @RequiredArgsConstructor
 public class SecurityConfig {
     
-    private final JwtAuthenticationFilter jwtAuthenticationFilter;
+    private final com.examprep.api.security.JwtTokenProvider jwtTokenProvider;
+    private final org.springframework.security.core.userdetails.UserDetailsService userDetailsService;
+    
+    @Value("${security.dev-mode.enabled:false}")
+    private boolean devModeEnabled;
     
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
@@ -36,9 +40,24 @@ public class SecurityConfig {
             .authorizeHttpRequests(auth -> auth
                 .requestMatchers("/api/v1/auth/**").permitAll()
                 .requestMatchers("/swagger-ui/**", "/v3/api-docs/**").permitAll()
+                .requestMatchers("/api/v1/llm/**").permitAll() // LLM stats endpoint for monitoring
                 .anyRequest().authenticated()
-            )
-            .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
+            );
+        
+        // Create and register filters
+        com.examprep.api.security.JwtAuthenticationFilter jwtFilter = 
+            new com.examprep.api.security.JwtAuthenticationFilter(jwtTokenProvider, userDetailsService);
+        
+        if (devModeEnabled) {
+            System.out.println("⚠️  ⚠️  ⚠️  DEV MODE ENABLED - Automatic authentication active. NEVER enable in production! ⚠️  ⚠️  ⚠️");
+            // Add dev filter first - it will authenticate all requests in dev mode
+            com.examprep.api.security.DevAuthenticationFilter devFilter = 
+                new com.examprep.api.security.DevAuthenticationFilter(devModeEnabled);
+            http.addFilterBefore(devFilter, UsernamePasswordAuthenticationFilter.class);
+        }
+        
+        // Add JWT filter - it only authenticates if a valid JWT token is present
+        http.addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
         
         return http.build();
     }

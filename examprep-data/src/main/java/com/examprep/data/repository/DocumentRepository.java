@@ -16,7 +16,7 @@ import java.util.Optional;
 import java.util.UUID;
 
 @Repository
-public interface DocumentRepository extends JpaRepository<Document, UUID> {
+public interface DocumentRepository extends JpaRepository<Document, UUID>, DocumentRepositoryCustom {
     
     Page<Document> findByUserId(UUID userId, Pageable pageable);
     
@@ -86,5 +86,50 @@ public interface DocumentRepository extends JpaRepository<Document, UUID> {
     @Transactional
     @Query(value = "DELETE FROM documents WHERE chat_id = :chatId", nativeQuery = true)
     void deleteByChatId(@Param("chatId") UUID chatId);
+    
+    /**
+     * Update document processing status using native query to avoid loading embedding column.
+     */
+    @Modifying
+    @Transactional
+    @Query(value = """
+        UPDATE documents 
+        SET processing_status = :status,
+            processing_started_at = :startedAt,
+            processing_completed_at = :completedAt,
+            error_message = :errorMessage,
+            total_pages = COALESCE(:totalPages, total_pages),
+            total_chunks = COALESCE(:totalChunks, total_chunks)
+        WHERE id = :id
+        """, nativeQuery = true)
+    void updateProcessingStatus(
+        @Param("id") UUID id,
+        @Param("status") String status,
+        @Param("startedAt") java.time.Instant startedAt,
+        @Param("completedAt") java.time.Instant completedAt,
+        @Param("errorMessage") String errorMessage,
+        @Param("totalPages") Integer totalPages,
+        @Param("totalChunks") Integer totalChunks
+    );
+    
+    /**
+     * Update document progress for batch embedding (processing tier, chunks_embedded, total_chunks).
+     */
+    @Modifying
+    @Transactional
+    @Query(value = """
+        UPDATE documents 
+        SET processing_tier = :processingTier,
+            chunks_embedded = :chunksEmbedded,
+            total_chunks = :totalChunks
+        WHERE id = :id
+        """, nativeQuery = true)
+    void updateDocumentProgress(
+        @Param("id") UUID id,
+        @Param("processingTier") String processingTier,
+        @Param("chunksEmbedded") Integer chunksEmbedded,
+        @Param("totalChunks") Integer totalChunks
+    );
+    
 }
 

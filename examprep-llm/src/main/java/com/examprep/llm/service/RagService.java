@@ -188,10 +188,11 @@ public class RagService {
             }
         }
         
-        // Don't return early - allow LLM to use internet search even when no chunks are found
-        // This enables answering general knowledge questions without uploaded documents
+        // Log if no chunks found - but still proceed to allow conversation history or explicit internet search
         if (filteredChunks.isEmpty() && (conversationHistory == null || conversationHistory.isEmpty())) {
-            log.info("No chunks found for user {} with query: {}. Proceeding with internet search.", userId, question);
+            log.warn("No chunks found for user {} with query: {}. Will use internet search ONLY if question is out of scope.", userId, question);
+        } else if (!filteredChunks.isEmpty()) {
+            log.info("Found {} relevant chunks. Prioritizing document content over internet search.", filteredChunks.size());
         }
         
         // Step 1.3: Build context from filtered chunks
@@ -265,24 +266,19 @@ public class RagService {
                - If conversation history contains the answer to the current question, prioritize that over document chunks
                - Maintain continuity - ensure follow-up questions are answered using context from previous messages
             
-            1.5. INTERNET SEARCH INTEGRATION (CRITICAL - USE WHEN INFORMATION IS MISSING):
-               - You have access to Google Search via the internet - USE IT whenever information is missing or incomplete
-               - ALWAYS check if the question can be fully answered from documents/conversation history
-               - If ANY part of the question cannot be answered from the context, instruct the answer-generating LLM to use Google Search
-               - Use Google Search for:
-                 * Industry benchmarks, market rates, salary comparisons, career advice
-                 * General knowledge questions not covered in documents
-                 * Current information, statistics, or recent developments
-                 * Comparative analysis or external validation
-                 * Questions completely out of scope (not related to uploaded documents)
-                 * Any missing information needed to provide a complete answer
-               - In your generated prompt, explicitly instruct the LLM to:
-                 * Use Google Search to find missing information
-                 * Clearly distinguish between document sources and internet sources
-                 * Mention "According to internet search..." or "Based on current market data (sourced from internet)..." when using internet
-               - Example: If asked "can he expect 40LPA+?", search for current salary trends for similar roles and experience
-               - Example: If asked "is the pay justifiable?", search for industry benchmarks and include comparison data from internet
-               - IMPORTANT: The system should act as a general AI assistant, not just exam prep - answer any question using internet when needed
+            1.5. INTERNET SEARCH INTEGRATION (LAST RESORT - ONLY WHEN NO DOCUMENTS AVAILABLE):
+               - CRITICAL: Documents are the PRIMARY source. Only use internet search if:
+                 * NO document chunks were retrieved AND the question is completely out of scope
+                 * The question is explicitly about general knowledge not in documents (e.g., "what is mindset?" when no relevant docs)
+               - DO NOT use internet search if:
+                 * Document chunks were retrieved - answer from documents first, even if incomplete
+                 * The question can be partially answered from documents - use documents and state what's missing
+                 * The question is about content that should be in uploaded documents
+               - If documents are available, instruct the LLM to:
+                 * Answer primarily from document context
+                 * Only mention internet search if explicitly needed for out-of-scope questions
+                 * Clearly distinguish: "Based on your documents: X" vs "According to internet search: Y"
+               - IMPORTANT: Prioritize document content. Internet search is a fallback, not the primary source.
             
             2. CONTEXT SYNTHESIS FROM DOCUMENT CHUNKS:
                - Only use document chunks if they are relevant to the current question
@@ -359,11 +355,11 @@ public class RagService {
             promptCreationUserPrompt.append("This appears to be a follow-up question. Answer using ONLY the conversation history above.\n");
             promptCreationUserPrompt.append("When citing sources, reference the conversation history (e.g., 'as mentioned in the previous conversation').\n\n");
         } else {
-            // No chunks and no conversation history - must use internet search
+            // No chunks and no conversation history - can use internet search as last resort
             promptCreationUserPrompt.append("=== CRITICAL: NO DOCUMENT CHUNKS OR CONVERSATION HISTORY AVAILABLE ===\n");
             promptCreationUserPrompt.append("No relevant information was found in uploaded documents or conversation history.\n");
-            promptCreationUserPrompt.append("YOU MUST instruct the answer-generating LLM to use Google Search (internet) to answer this question.\n");
-            promptCreationUserPrompt.append("This is a general knowledge question that requires internet search.\n\n");
+            promptCreationUserPrompt.append("Since no documents are available, you may instruct the answer-generating LLM to use Google Search (internet) to answer this question.\n");
+            promptCreationUserPrompt.append("However, FIRST check if the user has uploaded any documents - if they have, this might indicate a retrieval issue.\n\n");
         }
         
         promptCreationUserPrompt.append("=== CURRENT QUESTION ===\n");
@@ -419,9 +415,10 @@ public class RagService {
             promptCreationUserPrompt.append("   - NEVER cite documents that were not mentioned in the conversation history\n");
             promptCreationUserPrompt.append("6. In your generated prompt, explicitly tell the answer-generating LLM which documents to cite\n\n");
         } else if (retrievedContext.isEmpty() && conversationContext.isEmpty()) {
-            // No chunks and no conversation history - must use internet search
-            promptCreationUserPrompt.append("CRITICAL: NO DOCUMENTS OR CONVERSATION HISTORY AVAILABLE.\n");
-            promptCreationUserPrompt.append("You MUST create a prompt that instructs the answer-generating LLM to:\n");
+            // No chunks and no conversation history - can use internet search as last resort
+            promptCreationUserPrompt.append("=== CRITICAL: NO DOCUMENTS OR CONVERSATION HISTORY AVAILABLE ===\n");
+            promptCreationUserPrompt.append("No relevant information was found in uploaded documents or conversation history.\n");
+            promptCreationUserPrompt.append("Since no documents are available, you may create a prompt that instructs the answer-generating LLM to:\n");
             promptCreationUserPrompt.append("1. Use Google Search (internet) to find information about: ").append(question).append("\n");
             promptCreationUserPrompt.append("2. Search for general knowledge, biographical information, or any relevant details\n");
             promptCreationUserPrompt.append("3. Provide a comprehensive answer based on internet search results\n");
@@ -430,36 +427,37 @@ public class RagService {
             promptCreationUserPrompt.append("6. Do NOT mention document sources since none are available\n\n");
         } else {
             promptCreationUserPrompt.append("Create an optimized, comprehensive prompt that:\n");
-            promptCreationUserPrompt.append("1. Synthesizes document chunks into coherent, well-organized context\n");
+            promptCreationUserPrompt.append("1. PRIORITIZES document chunks - synthesize them into coherent, well-organized context\n");
             promptCreationUserPrompt.append("2. Incorporates conversation history to maintain context (if available)\n");
             promptCreationUserPrompt.append("3. Clearly presents the current question\n");
-            promptCreationUserPrompt.append("4. CRITICAL - INTERNET SEARCH INSTRUCTIONS:\n");
-            promptCreationUserPrompt.append("   - Analyze if the question can be fully answered from documents/conversation history\n");
-            promptCreationUserPrompt.append("   - If ANY information is missing or the question is out of scope, instruct the LLM to use Google Search\n");
-            promptCreationUserPrompt.append("   - Specify what should be searched (e.g., 'salary trends for Java developers with 2 years experience', 'RAG and vector DB job market', '40 LPA salary expectations')\n");
-            promptCreationUserPrompt.append("   - Tell the LLM to act as a general AI assistant - answer any question, not just exam prep\n");
-            promptCreationUserPrompt.append("   - Ensure clear distinction: 'Information from documents: X' vs 'Information from internet search: Y'\n");
-            promptCreationUserPrompt.append("   - Instruct to explicitly mention when using internet: 'According to internet search...' or 'Based on current market data (sourced from internet)...'\n");
+            promptCreationUserPrompt.append("4. CRITICAL - DOCUMENT-FIRST APPROACH:\n");
+            promptCreationUserPrompt.append("   - Answer the question PRIMARILY from the provided document chunks\n");
+            promptCreationUserPrompt.append("   - If the question can be answered from documents, DO NOT mention internet search\n");
+            promptCreationUserPrompt.append("   - Only if the question is completely out of scope (not related to documents at all), mention internet search\n");
+            promptCreationUserPrompt.append("   - Ensure clear distinction: 'Based on your documents: X' (primary) vs 'According to internet search: Y' (only if needed)\n");
             promptCreationUserPrompt.append("5. Includes instructions for answer structure, format, and citations\n");
-            promptCreationUserPrompt.append("6. Guides the LLM to generate a comprehensive answer using documents AND internet search when needed\n");
-            promptCreationUserPrompt.append("7. Ensures all aspects of the question are addressed\n");
+            promptCreationUserPrompt.append("6. Guides the LLM to generate a comprehensive answer using documents as the PRIMARY source\n");
+            promptCreationUserPrompt.append("7. Ensures all aspects of the question are addressed from document context\n");
             promptCreationUserPrompt.append("8. Maintains natural, conversational tone (not overly formal unless required)\n");
             promptCreationUserPrompt.append("9. Instructs the LLM to provide complete answers without truncation\n\n");
         }
         promptCreationUserPrompt.append("CRITICAL INSTRUCTIONS:\n");
+        promptCreationUserPrompt.append("- PRIORITIZE documents: If document chunks are available, answer from them FIRST\n");
         promptCreationUserPrompt.append("- If the question can be answered from conversation history, prioritize that information\n");
-        promptCreationUserPrompt.append("- If ANY information is missing or the question is out of scope, ALWAYS instruct the LLM to use Google Search\n");
-        promptCreationUserPrompt.append("- The system should act as a general AI assistant - answer any question using internet when needed\n");
+        promptCreationUserPrompt.append("- Only use internet search if NO documents are available AND the question is out of scope\n");
+        promptCreationUserPrompt.append("- DO NOT instruct the LLM to use Google Search if documents are available - use documents as primary source\n");
         promptCreationUserPrompt.append("- Always distinguish between document sources and internet sources in citations\n");
-        promptCreationUserPrompt.append("The prompt should be ready to use directly by another LLM to generate a comprehensive answer.");
+        promptCreationUserPrompt.append("The prompt should be ready to use directly by another LLM to generate a comprehensive answer from documents.");
         
         // Step 2.3: Call LLM to create optimized prompt
-        // Enable Google Search for prompt creation so it can search for missing information
-        log.info("Calling LLM to create optimized prompt (with Google Search enabled)...");
+        // Only enable Google Search if NO chunks were found (last resort)
+        boolean shouldUseGoogleSearch = filteredChunks.isEmpty() && conversationContext.isEmpty();
+        log.info("Calling LLM to create optimized prompt | useGoogleSearch={} | chunksFound={}", 
+            shouldUseGoogleSearch, filteredChunks.size());
         String optimizedPrompt = geminiClient.generateContent(
             promptCreationUserPrompt.toString(), 
             promptCreationSystemPrompt,
-            true  // Enable Google Search grounding
+            shouldUseGoogleSearch  // Only enable if no documents available
         );
         long promptCreationTime = System.currentTimeMillis() - startTime - embeddingTime - retrievalTime;
         
@@ -472,9 +470,10 @@ public class RagService {
         log.info("=== STAGE 3: Second LLM Call - Generating Final Answer ===");
         
         String answerSystemPrompt = ExamAnswerPrompts.SYSTEM_PROMPT;
-        log.info("Generating final answer using optimized prompt (with Google Search enabled)...");
-        // Enable Google Search for final answer generation as well
-        String answer = geminiClient.generateContent(optimizedPrompt, answerSystemPrompt, true);
+        // Reuse the same shouldUseGoogleSearch variable from Stage 2 (only enable if no documents available)
+        log.info("Generating final answer using optimized prompt | useGoogleSearch={} | chunksFound={}", 
+            shouldUseGoogleSearch, filteredChunks.size());
+        String answer = geminiClient.generateContent(optimizedPrompt, answerSystemPrompt, shouldUseGoogleSearch);
         long answerGenerationTime = System.currentTimeMillis() - startTime - embeddingTime - retrievalTime - promptCreationTime;
         
         log.info("=== STAGE 3 COMPLETE: Final answer generated ({}ms) ===", answerGenerationTime);

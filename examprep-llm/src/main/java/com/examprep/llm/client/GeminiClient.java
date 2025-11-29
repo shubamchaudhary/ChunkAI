@@ -22,7 +22,14 @@ public class GeminiClient {
      * Generate embeddings for text using text-embedding-004
      */
     public float[] generateEmbedding(String text) {
-        if (config.getApiKey() == null || config.getApiKey().isEmpty()) {
+        return generateEmbedding(text, config.getApiKey());
+    }
+    
+    /**
+     * Generate embeddings for text using text-embedding-004 with specific API key
+     */
+    public float[] generateEmbedding(String text, String apiKey) {
+        if (apiKey == null || apiKey.isEmpty()) {
             throw new RuntimeException("Gemini API key is not set. Please set GEMINI_API_KEY environment variable or gemini.api-key in application.properties");
         }
         
@@ -30,7 +37,7 @@ public class GeminiClient {
             "%s/models/%s:embedContent?key=%s",
             config.getBaseUrl(),
             config.getEmbeddingModel(),
-            config.getApiKey()
+            apiKey
         );
         
         log.debug("Generating embedding using URL: {} (API key length: {})", 
@@ -84,11 +91,22 @@ public class GeminiClient {
      * @param useGoogleSearch If true, enables Google Search grounding for internet access
      */
     public String generateContent(String prompt, String systemInstruction, boolean useGoogleSearch) {
+        return generateContent(prompt, systemInstruction, useGoogleSearch, config.getApiKey());
+    }
+    
+    /**
+     * Generate text using Gemini Flash with API key from lease.
+     * @param prompt The user prompt
+     * @param systemInstruction The system instruction
+     * @param useGoogleSearch If true, enables Google Search grounding for internet access
+     * @param apiKey The API key to use (from ApiKeyManager lease)
+     */
+    public String generateContent(String prompt, String systemInstruction, boolean useGoogleSearch, String apiKey) {
         String url = String.format(
             "%s/models/%s:generateContent?key=%s",
             config.getBaseUrl(),
             config.getGenerationModel(),
-            config.getApiKey()
+            apiKey
         );
         
         java.util.Map<String, Object> requestMap = new java.util.HashMap<>();
@@ -147,7 +165,7 @@ public class GeminiClient {
         } catch (org.springframework.web.reactive.function.client.WebClientResponseException e) {
             log.error("Gemini API error: Status={}, URL={}, Response={}", 
                 e.getStatusCode(), 
-                url.replace(config.getApiKey(), "***"), 
+                url.replace(apiKey, "***"), 
                 e.getResponseBodyAsString());
             if (e.getStatusCode().value() == 404) {
                 throw new RuntimeException(

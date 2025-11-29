@@ -68,6 +68,16 @@ public class Document {
     @Column(name = "error_message", columnDefinition = "TEXT")
     private String errorMessage;
     
+    // Batch embedding: Processing tier tracking
+    @Column(name = "processing_tier", length = 20)
+    @Builder.Default
+    private String processingTier = "PENDING"; // PENDING, EXTRACTING, CHUNKED, EMBEDDING, COMPLETED, FAILED
+    
+    // Batch embedding: Progress tracking
+    @Column(name = "chunks_embedded")
+    @Builder.Default
+    private Integer chunksEmbedded = 0;
+    
     @CreationTimestamp
     @Column(name = "created_at")
     private Instant createdAt;
@@ -79,5 +89,9 @@ public class Document {
     @OneToMany(mappedBy = "document", cascade = CascadeType.ALL, orphanRemoval = true)
     @Builder.Default
     private List<DocumentChunk> chunks = new ArrayList<>();
+    
+    // Transient field for similarity score (used in retrieval)
+    @Transient
+    private Double similarityScore;
 }
 

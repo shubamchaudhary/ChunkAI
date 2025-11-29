@@ -1,6 +1,5 @@
 package com.examprep.api.controller;
 
-import com.examprep.api.dto.request.QueryRequest;
 import com.examprep.api.dto.response.QueryResponse;
 import com.examprep.common.constants.ProcessingStatus;
 import lombok.extern.slf4j.Slf4j;
@@ -10,10 +9,10 @@ import com.examprep.data.entity.QueryHistory;
 import com.examprep.data.entity.User;
 import com.examprep.data.repository.ChatRepository;
 import com.examprep.data.repository.DocumentRepository;
+import com.examprep.core.query.QueryOrchestrator;
+import com.examprep.core.query.model.QueryResult;
 import com.examprep.data.repository.QueryHistoryRepository;
 import com.examprep.data.repository.UserRepository;
-import com.examprep.llm.service.EmbeddingService;
-import com.examprep.llm.service.RagService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import jakarta.validation.Valid;
@@ -37,20 +36,18 @@ import java.util.stream.Collectors;
 @Slf4j
 public class QueryController {
     
-    private final RagService ragService;
+    private final QueryOrchestrator queryOrchestrator;
     private final QueryHistoryRepository queryHistoryRepository;
     private final UserRepository userRepository;
     private final ChatRepository chatRepository;
     private final DocumentRepository documentRepository;
-    private final EmbeddingService embeddingService;
-    private final com.examprep.llm.client.GeminiConfig geminiConfig;
     
     @Autowired
     private ObjectMapper objectMapper;
     
     @PostMapping
     public ResponseEntity<QueryResponse> query(
-            @Valid @RequestBody QueryRequest request,
+            @Valid @RequestBody com.examprep.api.dto.request.QueryRequest request,
             Authentication authentication
     ) {
         UUID userId = UUID.fromString(authentication.getName());
@@ -78,18 +75,19 @@ public class QueryController {
             chatId, useCrossChat, question != null ? question.substring(0, Math.min(50, question.length())) : "null");
         
         // Check if there are any documents in this chat that are still processing
-        List<Document> processingDocs = documentRepository.findByChatId(chatId).stream()
+        // Use findByChatIdExcludingEmbedding to avoid loading vector columns with NULL values
+        List<Document> processingDocs = documentRepository.findByChatIdExcludingEmbedding(chatId).stream()
             .filter(doc -> doc.getProcessingStatus() == ProcessingStatus.PENDING 
                 || doc.getProcessingStatus() == ProcessingStatus.PROCESSING)
             .toList();
         
         if (!processingDocs.isEmpty()) {
             return ResponseEntity.status(400).body(
-                QueryResponse.builder()
+                com.examprep.api.dto.response.QueryResponse.builder()
                     .answer("Please wait for all documents to finish processing before asking questions. " +
                         processingDocs.size() + " document(s) are still being processed.")
                     .sources(List.of())
-                    .metadata(QueryResponse.Metadata.builder()
+                    .metadata(com.examprep.api.dto.response.QueryResponse.Metadata.builder()
                         .retrievalTimeMs(0L)
                         .generationTimeMs(0L)
                         .totalTimeMs(0L)
@@ -103,94 +101,65 @@ public class QueryController {
         // Only check for processing documents, not for completed documents
         // This allows users to ask questions without uploading files
         
-        long startTime = System.currentTimeMillis();
-        
-        // Get conversation history for context (configurable max Q&A pairs for larger context window)
-        List<String> conversationHistory = new ArrayList<>();
+        // Get conversation history for context
+        List<com.examprep.core.query.model.QueryRequest.ChatMessage> chatHistory = new ArrayList<>();
         try {
-            // Get max conversation history from config
-            int maxHistoryPairs = geminiConfig.getMaxConversationHistory();
             List<Object[]> recentHistory = queryHistoryRepository.findHistoryByUserIdAndChatIdNative(
                 userId, chatId, 
-                org.springframework.data.domain.PageRequest.of(0, maxHistoryPairs)
+                org.springframework.data.domain.PageRequest.of(0, 50) // Last 50 Q&A pairs
             );
-            // Reverse to get chronological order (oldest first) - this helps LLM understand the flow
+            // Reverse to get chronological order (oldest first)
             for (int i = recentHistory.size() - 1; i >= 0; i--) {
                 Object[] row = recentHistory.get(i);
                 String q = (String) row[3]; // query_text
                 String a = (String) row[5]; // answer_text
                 if (q != null && a != null && !a.trim().isEmpty()) {
-                    conversationHistory.add(q);
-                    // Don't truncate answers - preserve full context for follow-up questions
-                    // This ensures author names, book titles, and other details aren't cut off
-                    conversationHistory.add(a);
+                    chatHistory.add(com.examprep.core.query.model.QueryRequest.ChatMessage.builder()
+                        .role("user")
+                        .content(q)
+                        .build());
+                    chatHistory.add(com.examprep.core.query.model.QueryRequest.ChatMessage.builder()
+                        .role("assistant")
+                        .content(a)
+                        .build());
                 }
             }
-            log.info("Loaded {} Q&A pairs for conversation context. History size: {} items", 
-                conversationHistory.size() / 2, conversationHistory.size());
+            log.info("Loaded {} Q&A pairs for conversation context", chatHistory.size() / 2);
         } catch (Exception e) {
             log.warn("Failed to load conversation history", e);
         }
         
-        // Generate query embedding for history
-        float[] queryEmbedding = embeddingService.generateEmbedding(request.getQuestion());
+        // Build core query request
+        com.examprep.core.query.model.QueryRequest coreRequest = com.examprep.core.query.model.QueryRequest.builder()
+            .userId(userId)
+            .chatId(chatId)
+            .question(request.getQuestion())
+            .marks(request.getMarks())
+            .formatInstructions(request.getFormatInstructions())
+            .documentIds(request.getDocumentIds())
+            .useCrossChat(useCrossChat)
+            .chatHistory(chatHistory)
+            .build();
         
-        // Log the actual values being used
-        log.info("Calling RAG service with - chatId: {}, useCrossChat: {}, question length: {}", 
-            chatId, useCrossChat, request.getQuestion().length());
+        // Process query using v2.0 QueryOrchestrator
+        com.examprep.core.query.model.QueryResult result = queryOrchestrator.processQuery(coreRequest);
         
-        RagService.RagResult result = ragService.query(
-            userId,
-            request.getQuestion(),
-            request.getMarks(),
-            request.getDocumentIds(),
-            request.getFormatInstructions(),
-            chatId,
-            useCrossChat,
-            conversationHistory
-        );
-        
-        long totalTime = System.currentTimeMillis() - startTime;
-        
-        // Save to query history
-        try {
-            String sourcesJson = objectMapper.writeValueAsString(result.getSources());
-            
-            QueryHistory history = QueryHistory.builder()
-                .user(user)
-                .chat(chat)
-                .queryText(request.getQuestion())
-                .queryEmbedding(queryEmbedding)
-                .marksRequested(request.getMarks())
-                .answerText(result.getAnswer())
-                .sourcesUsed(sourcesJson)
-                .retrievalTimeMs(result.getRetrievalTimeMs().intValue())
-                .generationTimeMs(result.getGenerationTimeMs().intValue())
-                .totalTimeMs((int) totalTime)
-                .chunksRetrieved(result.getChunksUsed())
-                .build();
-            
-            queryHistoryRepository.save(history);
-        } catch (Exception e) {
-            // Log but don't fail the request
-            e.printStackTrace();
-        }
-        
-        QueryResponse response = QueryResponse.builder()
+        // Convert to API response
+        com.examprep.api.dto.response.QueryResponse response = com.examprep.api.dto.response.QueryResponse.builder()
             .answer(result.getAnswer())
-            .sources(result.getSources().stream()
-                .map(source -> QueryResponse.SourceInfo.builder()
+            .sources(result.getSources() != null ? result.getSources().stream()
+                .map(source -> com.examprep.api.dto.response.QueryResponse.SourceInfo.builder()
                     .documentId(source.getDocumentId())
                     .fileName(source.getFileName())
                     .pageNumber(source.getPageNumber())
                     .slideNumber(source.getSlideNumber())
                     .excerpt(source.getExcerpt())
                     .build())
-                .collect(Collectors.toList()))
-            .metadata(QueryResponse.Metadata.builder()
-                .retrievalTimeMs(result.getRetrievalTimeMs())
-                .generationTimeMs(result.getGenerationTimeMs())
-                .totalTimeMs(result.getRetrievalTimeMs() + result.getGenerationTimeMs())
+                .collect(Collectors.toList()) : List.of())
+            .metadata(com.examprep.api.dto.response.QueryResponse.Metadata.builder()
+                .retrievalTimeMs(0L) // Not tracked separately in v2.0
+                .generationTimeMs(0L) // Not tracked separately in v2.0
+                .totalTimeMs(0L) // Tracked in QueryResult
                 .chunksUsed(result.getChunksUsed())
                 .build())
             .build();
