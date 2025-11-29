@@ -162,5 +162,76 @@ public class DocumentChunkRepositoryImpl implements DocumentChunkRepositoryCusto
             .filter(chunk -> chunk != null)
             .collect(Collectors.toList());
     }
+    
+    @Override
+    public void batchSaveChunksWithEmbeddings(List<DocumentChunk> chunks) {
+        if (chunks == null || chunks.isEmpty()) {
+            return;
+        }
+        
+        log.info("Batch saving {} chunks with embeddings using native SQL", chunks.size());
+        
+        // Use individual inserts in a transaction (simpler and avoids parameter binding complexity)
+        String insertSql = """
+            INSERT INTO document_chunks 
+            (id, document_id, user_id, chat_id, chunk_index, content, content_hash, 
+             page_number, slide_number, section_title, embedding, token_count, created_at)
+            VALUES (CAST(:id AS uuid), CAST(:docId AS uuid), CAST(:userId AS uuid), CAST(:chatId AS uuid), 
+                    :chunkIndex, :content, :contentHash, :pageNum, :slideNum, :sectionTitle, 
+                    CAST(:embedding AS vector), :tokenCount, NOW())
+            """;
+        
+        int savedCount = 0;
+        for (DocumentChunk chunk : chunks) {
+            try {
+                String embeddingStr = null;
+                if (chunk.getEmbedding() != null && chunk.getEmbedding().length > 0) {
+                    embeddingStr = convertEmbeddingToVectorString(chunk.getEmbedding());
+                }
+                
+                UUID chunkId = chunk.getId() != null ? chunk.getId() : UUID.randomUUID();
+                
+                Query query = entityManager.createNativeQuery(insertSql);
+                query.setParameter("id", chunkId.toString());
+                query.setParameter("docId", chunk.getDocument().getId().toString());
+                query.setParameter("userId", chunk.getUserId().toString());
+                query.setParameter("chatId", chunk.getChatId().toString());
+                query.setParameter("chunkIndex", chunk.getChunkIndex());
+                query.setParameter("content", chunk.getContent());
+                query.setParameter("contentHash", chunk.getContentHash());
+                query.setParameter("pageNum", chunk.getPageNumber());
+                query.setParameter("slideNum", chunk.getSlideNumber());
+                query.setParameter("sectionTitle", chunk.getSectionTitle());
+                query.setParameter("embedding", embeddingStr);
+                query.setParameter("tokenCount", chunk.getTokenCount());
+                
+                query.executeUpdate();
+                savedCount++;
+            } catch (Exception e) {
+                log.error("Failed to save chunk at index {}: {}", chunk.getChunkIndex(), e.getMessage(), e);
+                throw new RuntimeException("Failed to save chunk: " + e.getMessage(), e);
+            }
+        }
+        
+        log.info("Batch insert completed: {} chunks saved", savedCount);
+    }
+    
+    /**
+     * Convert float[] embedding to PostgreSQL vector string format: [f1,f2,f3,...]
+     */
+    private String convertEmbeddingToVectorString(float[] embedding) {
+        if (embedding == null || embedding.length == 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < embedding.length; i++) {
+            if (i > 0) {
+                sb.append(",");
+            }
+            sb.append(embedding[i]);
+        }
+        sb.append("]");
+        return sb.toString();
+    }
 }
 

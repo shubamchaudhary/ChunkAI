@@ -19,6 +19,8 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 @Service
@@ -35,7 +37,7 @@ public class RagService {
     // Thread pool for parallel API calls
     private final ExecutorService executorService = Executors.newFixedThreadPool(3);
     
-    private static final int TOP_CHUNKS = 150;
+    private static final int TOP_CHUNKS = 100; // Reduced from 150 to speed up processing
     
     /**
      * Enhanced RAG pipeline with parallel prompt generation:
@@ -155,18 +157,29 @@ public class RagService {
         
         log.info("Created {} futures for parallel processing", promptFutures.size());
         
-        // Wait for all prompts to complete
-        log.info("Waiting for {} futures to complete...", promptFutures.size());
+        // Wait for all prompts to complete with timeout (10 seconds per API call)
+        log.info("Waiting for {} futures to complete (timeout: 30s total)...", promptFutures.size());
         List<String> generatedPrompts = new ArrayList<>();
+        long promptStartTime = System.currentTimeMillis();
+        long maxWaitTime = 30000; // 30 seconds max for all prompt generation
+        
         for (int i = 0; i < promptFutures.size(); i++) {
             try {
-                String prompt = promptFutures.get(i).join();
+                long remainingTime = maxWaitTime - (System.currentTimeMillis() - promptStartTime);
+                if (remainingTime <= 0) {
+                    log.warn("Timeout reached, skipping remaining prompt generation");
+                    break;
+                }
+                
+                String prompt = promptFutures.get(i).get(Math.min(remainingTime, 15000), TimeUnit.MILLISECONDS);
                 if (!prompt.isEmpty()) {
                     generatedPrompts.add(prompt);
                     log.info("Future {} completed successfully, prompt length: {}", i + 1, prompt.length());
                 } else {
                     log.warn("Future {} returned empty prompt", i + 1);
                 }
+            } catch (TimeoutException e) {
+                log.warn("Future {} timed out, skipping", i + 1);
             } catch (Exception e) {
                 log.error("Future {} failed: {}", i + 1, e.getMessage(), e);
             }

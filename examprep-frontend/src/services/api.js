@@ -103,7 +103,9 @@ export const documentAPI = {
 
 // Query API
 export const queryAPI = {
-  query: (data) => api.post('/query', data),
+  query: (data) => api.post('/query', data, {
+    timeout: 60000, // 60 seconds for RAG queries (backend timeout is 30s, frontend must be more patient)
+  }),
   getHistory: (params) => api.get('/query/history', { params }),
 };
 

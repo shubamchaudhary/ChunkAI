@@ -7,7 +7,6 @@ import com.examprep.data.repository.DocumentRepository;
 import com.examprep.data.repository.ProcessingJobRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
@@ -109,7 +108,15 @@ public class ProcessingJobWorker {
             
         } catch (Exception e) {
             log.error("Error processing job {}: {}", jobId, e.getMessage(), e);
+            // Always handle failure in a separate transaction to avoid rollback issues
             handleJobFailure(jobId, documentId, e);
+        } finally {
+            // Ensure we always release the lock, even if error handling fails
+            try {
+                releaseJobLockIfStale(jobId);
+            } catch (Exception ex) {
+                log.warn("Failed to release lock for job {} in finally block", jobId, ex);
+            }
         }
     }
     
@@ -142,33 +149,99 @@ public class ProcessingJobWorker {
         jobRepository.save(completedJob);
     }
     
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    /**
+     * Handle job failure in a completely separate transaction.
+     * This ensures the failure status is saved even if the main transaction is rolled back.
+     * Uses REQUIRES_NEW to create a fresh transaction, isolated from any rollback.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW, rollbackFor = Exception.class)
     private void handleJobFailure(UUID jobId, UUID documentId, Exception e) {
         try {
+            log.info("Handling failure for job {} in separate transaction", jobId);
+            
+            // Reload job in new transaction context
             ProcessingJob failedJob = jobRepository.findById(jobId)
                 .orElseThrow(() -> new RuntimeException("Job not found: " + jobId));
             
+            String errorMessage = e.getMessage();
+            if (errorMessage == null || errorMessage.isEmpty()) {
+                errorMessage = e.getClass().getSimpleName() + ": " + (e.getCause() != null ? e.getCause().getMessage() : "Unknown error");
+            }
+            
             if (failedJob.getAttempts() >= failedJob.getMaxAttempts()) {
+                // Final failure - mark as FAILED
                 failedJob.setStatus("FAILED");
-                failedJob.setLastError(e.getMessage());
+                failedJob.setLastError(errorMessage);
                 failedJob.setCompletedAt(Instant.now());
-                
-                if (documentId != null) {
-                    Document document = documentRepository.findById(documentId)
-                        .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
-                    document.setProcessingStatus(ProcessingStatus.FAILED);
-                    document.setErrorMessage("Processing failed after " + failedJob.getAttempts() + " attempts: " + e.getMessage());
-                    documentRepository.save(document);
-                }
-            } else {
-                failedJob.setStatus("QUEUED");
-                failedJob.setLastError(e.getMessage());
                 failedJob.setLockedUntil(null);
                 failedJob.setLockedBy(null);
+                jobRepository.save(failedJob);
+                
+                // Update document status in same transaction
+                if (documentId != null) {
+                    try {
+                        Document document = documentRepository.findById(documentId)
+                            .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
+                        document.setProcessingStatus(ProcessingStatus.FAILED);
+                        document.setErrorMessage("Processing failed after " + failedJob.getAttempts() + " attempts: " + errorMessage);
+                        documentRepository.save(document);
+                        log.info("Marked document {} as FAILED due to job failure", documentId);
+                    } catch (Exception docEx) {
+                        log.error("Failed to update document {} status, but job {} marked as FAILED", documentId, jobId, docEx);
+                        // Don't rethrow - job status is more important
+                    }
+                }
+                
+                log.warn("Job {} and document {} marked as FAILED (attempts: {}/{})", 
+                    jobId, documentId, failedJob.getAttempts(), failedJob.getMaxAttempts());
+            } else {
+                // Retry - requeue the job
+                failedJob.setStatus("QUEUED");
+                failedJob.setLastError(errorMessage);
+                failedJob.setLockedUntil(null);
+                failedJob.setLockedBy(null);
+                jobRepository.save(failedJob);
+                
+                log.info("Job {} requeued for retry (attempt {}/{})", 
+                    jobId, failedJob.getAttempts(), failedJob.getMaxAttempts());
             }
-            jobRepository.save(failedJob);
         } catch (Exception ex) {
-            log.error("Error updating job status after failure", ex);
+            // Even error handling failed - log but don't throw
+            log.error("CRITICAL: Failed to update job {} status after failure. Job may appear stuck in PROCESSING.", 
+                jobId, ex);
+            // Try one more time with minimal operation
+            try {
+                ProcessingJob job = jobRepository.findById(jobId).orElse(null);
+                if (job != null && "PROCESSING".equals(job.getStatus())) {
+                    job.setStatus("QUEUED"); // Fallback to QUEUED so it can be retried
+                    job.setLockedUntil(null);
+                    job.setLockedBy(null);
+                    jobRepository.save(job);
+                    log.warn("Fallback: Reset job {} to QUEUED status", jobId);
+                }
+            } catch (Exception fallbackEx) {
+                log.error("CRITICAL: Even fallback failed for job {}. Manual intervention required.", jobId, fallbackEx);
+            }
+        }
+    }
+    
+    /**
+     * Release stale job locks to prevent jobs from appearing stuck.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    private void releaseJobLockIfStale(UUID jobId) {
+        try {
+            ProcessingJob job = jobRepository.findById(jobId).orElse(null);
+            if (job != null && "PROCESSING".equals(job.getStatus())) {
+                if (job.getLockedUntil() != null && job.getLockedUntil().isBefore(Instant.now())) {
+                    log.warn("Releasing stale lock for job {} (lock expired at {})", jobId, job.getLockedUntil());
+                    job.setLockedUntil(null);
+                    job.setLockedBy(null);
+                    jobRepository.save(job);
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Could not release lock for job {}: {}", jobId, e.getMessage());
         }
     }
 }

@@ -1,7 +1,6 @@
 package com.examprep.data.repository;
 
 import com.examprep.data.entity.DocumentChunk;
-
 import java.util.List;
 import java.util.UUID;
 
@@ -24,5 +23,12 @@ public interface DocumentChunkRepositoryCustom {
         boolean useCrossChat,
         int limit
     );
+    
+    /**
+     * Batch save document chunks with embeddings using native SQL.
+     * This avoids Hibernate's float[] to pgvector mapping issues.
+     * @param chunks List of chunks to save (must have embeddings as float[])
+     */
+    void batchSaveChunksWithEmbeddings(List<DocumentChunk> chunks);
 }
 

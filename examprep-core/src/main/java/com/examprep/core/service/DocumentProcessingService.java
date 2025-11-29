@@ -49,12 +49,8 @@ public class DocumentProcessingService {
             // Get processor for file type
             DocumentProcessor processor = processorFactory.getProcessor(document.getFileType());
             
-            // Load file from storage
-            if (!fileStorageService.fileExists(document.getId())) {
-                throw new RuntimeException("File not found in storage for document: " + document.getId());
-            }
-            
-            InputStream fileStream = fileStorageService.getFile(document.getId());
+            // Load file from storage with retry logic to handle race conditions
+            InputStream fileStream = waitForFileAndGet(document.getId(), 5, 1000); // 5 retries, 1 second delay
             
             // Extract text from file
             ExtractionResult extractionResult = processor.extract(fileStream, document.getFileType());
@@ -136,8 +132,10 @@ public class DocumentProcessingService {
         Document document = documentRepository.findById(documentId)
             .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
         
-        // Batch save all chunks
-        chunkRepository.saveAll(chunks);
+        // Use native SQL batch insert to avoid Hibernate vector mapping issues
+        com.examprep.data.repository.DocumentChunkRepositoryCustom customRepo = 
+            (com.examprep.data.repository.DocumentChunkRepositoryCustom) chunkRepository;
+        customRepo.batchSaveChunksWithEmbeddings(chunks);
         
         // Update document status
         document.setTotalPages(totalPages);
@@ -145,6 +143,39 @@ public class DocumentProcessingService {
         document.setProcessingStatus(ProcessingStatus.COMPLETED);
         document.setProcessingCompletedAt(java.time.Instant.now());
         documentRepository.save(document);
+    }
+    
+    /**
+     * Wait for file to be available with retry logic (fixes race condition)
+     */
+    private InputStream waitForFileAndGet(UUID documentId, int maxRetries, long delayMs) throws Exception {
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            if (fileStorageService.fileExists(documentId)) {
+                try {
+                    InputStream stream = fileStorageService.getFile(documentId);
+                    log.debug("File found for document {} after {} attempt(s)", documentId, attempt);
+                    return stream;
+                } catch (Exception e) {
+                    log.warn("File exists but failed to open for document {} (attempt {}/{}): {}", 
+                        documentId, attempt, maxRetries, e.getMessage());
+                    if (attempt == maxRetries) {
+                        throw e;
+                    }
+                }
+            } else {
+                log.warn("File not found for document {} (attempt {}/{})", documentId, attempt, maxRetries);
+                if (attempt < maxRetries) {
+                    try {
+                        Thread.sleep(delayMs * attempt); // Exponential backoff
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Interrupted while waiting for file", e);
+                    }
+                }
+            }
+        }
+        
+        throw new RuntimeException("File not found in storage for document: " + documentId + " after " + maxRetries + " attempts");
     }
     
     @Transactional

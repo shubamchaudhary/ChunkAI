@@ -35,10 +35,25 @@ public class LocalFileStorageService implements FileStorageService {
             String fileName = documentId.toString() + (extension.isEmpty() ? "" : "." + extension);
             Path filePath = storagePath.resolve(fileName);
             
-            // Save file
-            Files.copy(file.getInputStream(), filePath, StandardCopyOption.REPLACE_EXISTING);
+            // Save file and ensure it's flushed to disk
+            try (java.io.InputStream inputStream = file.getInputStream();
+                 java.io.FileOutputStream outputStream = new java.io.FileOutputStream(filePath.toFile())) {
+                
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                while ((bytesRead = inputStream.read(buffer)) != -1) {
+                    outputStream.write(buffer, 0, bytesRead);
+                }
+                outputStream.getFD().sync(); // Force flush to disk
+            }
             
-            log.info("Saved file for document {} to {}", documentId, filePath);
+            // Verify file exists and has size
+            if (!Files.exists(filePath) || Files.size(filePath) == 0) {
+                throw new RuntimeException("File was not properly saved: " + filePath);
+            }
+            
+            log.info("Saved file for document {} to {} (size: {} bytes)", 
+                documentId, filePath, Files.size(filePath));
             return documentId;
         } catch (IOException e) {
             log.error("Failed to save file for document {}", documentId, e);
