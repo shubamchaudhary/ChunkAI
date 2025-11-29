@@ -83,6 +83,7 @@ export const documentAPI = {
     formData.append('chatId', chatId);
     return api.post('/documents/upload', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 300000, // 5 minutes for single file upload
     });
   },
   uploadBulk: (files, chatId) => {
@@ -91,6 +92,7 @@ export const documentAPI = {
     formData.append('chatId', chatId);
     return api.post('/documents/upload/bulk', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 1800000, // 30 minutes for bulk upload (45 files need time)
     });
   },
   getAll: (params) => api.get('/documents', { params }),

@@ -14,6 +14,7 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -35,10 +36,10 @@ public class ProcessingJobWorker {
     
     private static final String WORKER_ID = "worker-" + UUID.randomUUID().toString().substring(0, 8);
     private static final int LOCK_DURATION_SECONDS = 300; // 5 minutes
-    private static final int BATCH_SIZE = 10; // Process 10 jobs in parallel
+    private static final int BATCH_SIZE = 3; // Process only 3 jobs in parallel to avoid overwhelming Gemini API
     private static final ExecutorService executorService = Executors.newFixedThreadPool(BATCH_SIZE);
     
-    @Scheduled(fixedDelay = 2000) // Run every 2 seconds for faster processing
+    @Scheduled(fixedDelay = 5000) // Run every 5 seconds to avoid overwhelming the system
     @Transactional // Required for repository queries with @Lock
     public void processQueuedJobs() {
         try {
@@ -60,10 +61,25 @@ public class ProcessingJobWorker {
                 .map(ProcessingJob::getId)
                 .collect(Collectors.toList());
             
-            // Process all jobs in parallel using IDs
-            List<CompletableFuture<Void>> futures = jobIds.stream()
-                .map(jobId -> CompletableFuture.runAsync(() -> processJobById(jobId), executorService))
-                .collect(Collectors.toList());
+            // Stagger job processing to avoid overwhelming API - start jobs with delays
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            for (int i = 0; i < jobIds.size(); i++) {
+                final UUID jobId = jobIds.get(i);
+                // Stagger: wait 2 seconds before starting each new job
+                final int delayMs = i * 2000;
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                    if (delayMs > 0) {
+                        try {
+                            Thread.sleep(delayMs);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            log.warn("Interrupted while waiting to start job {}", jobId);
+                        }
+                    }
+                    processJobById(jobId);
+                }, executorService);
+                futures.add(future);
+            }
             
             // Wait for all to complete (but don't block the scheduler)
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))

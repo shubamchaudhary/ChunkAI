@@ -55,30 +55,70 @@ public class GeminiClient {
             )
         );
         
-        try {
-            EmbeddingResponse response = webClientBuilder.build()
-                .post()
-                .uri(url)
-                .bodyValue(request)
-                .retrieve()
-                .bodyToMono(EmbeddingResponse.class)
-                .block();
-            
-            if (response == null || response.getEmbedding() == null) {
-                throw new RuntimeException("Failed to generate embedding: response was null or empty");
+        // Retry logic for connection errors
+        int maxRetries = 3;
+        long baseDelayMs = 1000; // Start with 1 second
+        Exception lastException = null;
+        
+        for (int attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                EmbeddingResponse response = webClientBuilder.build()
+                    .post()
+                    .uri(url)
+                    .bodyValue(request)
+                    .retrieve()
+                    .bodyToMono(EmbeddingResponse.class)
+                    .block();
+                
+                if (response == null || response.getEmbedding() == null) {
+                    throw new RuntimeException("Failed to generate embedding: response was null or empty");
+                }
+                
+                return response.getEmbedding().getValues();
+            } catch (org.springframework.web.reactive.function.client.WebClientResponseException e) {
+                String responseBody = e.getResponseBodyAsString();
+                log.error("Gemini API error: Status={}, Response={}", e.getStatusCode(), responseBody);
+                if (e.getStatusCode().value() == 403) {
+                    // Check if it's a leaked key error
+                    if (responseBody != null && responseBody.contains("leaked")) {
+                        throw new RuntimeException(
+                            "API key was reported as leaked. Please use another API key. Error: " + responseBody, e);
+                    }
+                    throw new RuntimeException(
+                        "Gemini API authentication failed (403 Forbidden). " +
+                        "Please check: 1) API key is valid, 2) API key has access to embedding models, " +
+                        "3) API key is not expired. Error: " + responseBody, e);
+                }
+                // Don't retry on HTTP errors (except 429 rate limit)
+                if (e.getStatusCode().value() != 429 && e.getStatusCode().value() < 500) {
+                    throw new RuntimeException("Failed to generate embedding: " + e.getMessage(), e);
+                }
+                lastException = e;
+            } catch (org.springframework.web.reactive.function.client.WebClientRequestException e) {
+                // Connection errors - retry with exponential backoff
+                lastException = e;
+                if (attempt < maxRetries - 1) {
+                    long delayMs = baseDelayMs * (1L << attempt); // Exponential backoff: 1s, 2s, 4s
+                    log.warn("Connection error during embedding generation (attempt {}/{}), retrying in {}ms: {}", 
+                        attempt + 1, maxRetries, delayMs, e.getMessage());
+                    try {
+                        Thread.sleep(delayMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Interrupted during retry delay", ie);
+                    }
+                } else {
+                    log.error("Connection error after {} attempts: {}", maxRetries, e.getMessage());
+                }
+            } catch (Exception e) {
+                // Other errors - don't retry
+                throw new RuntimeException("Failed to generate embedding: " + e.getMessage(), e);
             }
-            
-            return response.getEmbedding().getValues();
-        } catch (org.springframework.web.reactive.function.client.WebClientResponseException e) {
-            log.error("Gemini API error: Status={}, Response={}", e.getStatusCode(), e.getResponseBodyAsString());
-            if (e.getStatusCode().value() == 403) {
-                throw new RuntimeException(
-                    "Gemini API authentication failed (403 Forbidden). " +
-                    "Please check: 1) API key is valid, 2) API key has access to embedding models, " +
-                    "3) API key is not expired. Error: " + e.getResponseBodyAsString(), e);
-            }
-            throw new RuntimeException("Failed to generate embedding: " + e.getMessage(), e);
         }
+        
+        // If we exhausted retries, throw the last exception
+        throw new RuntimeException("Failed to generate embedding after " + maxRetries + " attempts: " + 
+            (lastException != null ? lastException.getMessage() : "Unknown error"), lastException);
     }
     
     /**
