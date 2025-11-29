@@ -33,6 +33,7 @@ public class DocumentProcessingService {
     private final ChunkingService chunkingService;
     private final EmbeddingService embeddingService;
     private final FileStorageService fileStorageService;
+    private final com.examprep.llm.keymanager.ApiKeyManager apiKeyManager;
     
     /**
      * Process document - split into transaction boundaries to avoid connection leaks
@@ -66,13 +67,22 @@ public class DocumentProcessingService {
                 extractionResult.getPageTitles()
             );
             
-            // Generate embeddings OUTSIDE transaction (API calls can take minutes)
+            // Assign this document to a specific API key based on document ID hash
+            // This ensures parallel jobs use different keys simultaneously
+            int numKeys = apiKeyManager.getKeyCount();
+            int assignedKeyIndex = Math.abs(documentId.hashCode()) % numKeys;
+            
+            log.info("Processing document {} with API key {} ({} chunks)", 
+                document.getFileName(), assignedKeyIndex + 1, chunks.size());
+            
+            // Generate embeddings OUTSIDE transaction using assigned API key (API calls can take minutes)
             List<DocumentChunk> documentChunks = new java.util.ArrayList<>();
             UUID userId = document.getUser().getId();
             UUID chatId = document.getChat().getId();
             
             for (ChunkingResult chunk : chunks) {
-                float[] embedding = embeddingService.generateEmbedding(chunk.getContent());
+                // Use assigned API key for all chunks in this document
+                float[] embedding = embeddingService.generateEmbedding(chunk.getContent(), assignedKeyIndex);
                 
                 DocumentChunk documentChunk = DocumentChunk.builder()
                     .document(document)
@@ -94,8 +104,8 @@ public class DocumentProcessingService {
             // Save all chunks in a single transaction (batch save)
             saveChunksAndComplete(documentId, documentChunks, extractionResult.getTotalPages());
             
-            log.info("Completed processing for document: {} - {} chunks created", 
-                document.getFileName(), chunks.size());
+            log.info("Completed processing for document: {} - {} chunks created using API key {}", 
+                document.getFileName(), chunks.size(), assignedKeyIndex + 1);
             
         } catch (Exception e) {
             log.error("Error processing document: {}", documentId, e);

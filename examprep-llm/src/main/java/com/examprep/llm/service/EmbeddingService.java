@@ -17,47 +17,37 @@ public class EmbeddingService {
     private final GeminiClient geminiClient;
     private final ApiKeyManager apiKeyManager;
     
-    // Rate limiting: add delay between embedding requests to avoid API limits
-    private static final long EMBEDDING_DELAY_MS = 300; // 300ms delay between requests (~3 requests per second max)
-    private static long lastEmbeddingTime = 0;
-    private static final Object embeddingLock = new Object();
+    // Per-key rate limiting: track last request time for each API key separately
+    private static final long EMBEDDING_DELAY_MS = 300; // 300ms delay between requests per key
+    private static final java.util.concurrent.ConcurrentHashMap<Integer, Long> lastRequestTimeByKeyIndex = new java.util.concurrent.ConcurrentHashMap<>();
     
     /**
      * Generate embedding for a single text with automatic retry on leaked keys
+     * Uses round-robin key selection with per-key rate limiting
      */
     public float[] generateEmbedding(String text) {
         log.debug("Generating embedding for text of length: {}", text.length());
         
-        // Rate limiting: ensure minimum delay between requests
-        synchronized (embeddingLock) {
-            long currentTime = System.currentTimeMillis();
-            long timeSinceLastRequest = currentTime - lastEmbeddingTime;
-            if (timeSinceLastRequest < EMBEDDING_DELAY_MS) {
-                try {
-                    Thread.sleep(EMBEDDING_DELAY_MS - timeSinceLastRequest);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-            lastEmbeddingTime = System.currentTimeMillis();
-        }
-        
         // Try with round-robin key first
         String apiKey = apiKeyManager.getNextApiKey();
+        int keyIndex = findKeyIndex(apiKey);
         int maxRetries = apiKeyManager.getKeyCount();
         int attempts = 0;
         
         while (attempts < maxRetries) {
             try {
+                // Per-key rate limiting: only delay if same key was used recently
+                enforceRateLimit(keyIndex);
                 return geminiClient.generateEmbedding(text, apiKey);
             } catch (RuntimeException e) {
                 // Check if it's a leaked key error
                 if (e.getMessage() != null && e.getMessage().contains("leaked")) {
-                    log.warn("API key reported as leaked, trying next key (attempt {}/{})", 
-                        attempts + 1, maxRetries);
+                    log.warn("API key {} reported as leaked, trying next key (attempt {}/{})", 
+                        keyIndex, attempts + 1, maxRetries);
                     attempts++;
                     if (attempts < maxRetries) {
                         apiKey = apiKeyManager.getNextApiKey(); // Try next key
+                        keyIndex = findKeyIndex(apiKey);
                         continue;
                     }
                 }
@@ -67,6 +57,48 @@ public class EmbeddingService {
         }
         
         throw new RuntimeException("All API keys failed. Please check GEMINI_API_KEYS environment variable.");
+    }
+    
+    /**
+     * Generate embedding using a specific API key (for parallel processing across keys)
+     */
+    public float[] generateEmbedding(String text, int keyIndex) {
+        log.debug("Generating embedding for text of length: {} using API key {}", text.length(), keyIndex);
+        
+        String apiKey = apiKeyManager.getApiKey(keyIndex);
+        
+        // Per-key rate limiting
+        enforceRateLimit(keyIndex);
+        
+        return geminiClient.generateEmbedding(text, apiKey);
+    }
+    
+    private void enforceRateLimit(int keyIndex) {
+        long currentTime = System.currentTimeMillis();
+        Long lastTime = lastRequestTimeByKeyIndex.get(keyIndex);
+        
+        if (lastTime != null) {
+            long timeSinceLastRequest = currentTime - lastTime;
+            if (timeSinceLastRequest < EMBEDDING_DELAY_MS) {
+                try {
+                    Thread.sleep(EMBEDDING_DELAY_MS - timeSinceLastRequest);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+        
+        lastRequestTimeByKeyIndex.put(keyIndex, System.currentTimeMillis());
+    }
+    
+    private int findKeyIndex(String apiKey) {
+        List<String> allKeys = apiKeyManager.getAllApiKeys();
+        for (int i = 0; i < allKeys.size(); i++) {
+            if (allKeys.get(i).equals(apiKey)) {
+                return i;
+            }
+        }
+        return 0; // Default to first key if not found
     }
     
     /**
