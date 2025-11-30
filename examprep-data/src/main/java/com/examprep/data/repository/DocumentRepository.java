@@ -86,5 +86,83 @@ public interface DocumentRepository extends JpaRepository<Document, UUID> {
     @Transactional
     @Query(value = "DELETE FROM documents WHERE chat_id = :chatId", nativeQuery = true)
     void deleteByChatId(@Param("chatId") UUID chatId);
+    
+    /**
+     * Update document processing status and metadata using native SQL.
+     * Avoids loading entity and related DocumentChunk entities with vector fields.
+     */
+    @Modifying
+    @Transactional
+    @Query(value = """
+        UPDATE documents 
+        SET processing_status = :status,
+            total_pages = :totalPages,
+            total_chunks = :totalChunks,
+            processing_started_at = :startedAt,
+            processing_completed_at = :completedAt,
+            error_message = :errorMessage,
+            updated_at = NOW()
+        WHERE id = CAST(:documentId AS uuid)
+        """, nativeQuery = true)
+    int updateDocumentStatus(
+        @Param("documentId") UUID documentId,
+        @Param("status") String status,
+        @Param("totalPages") Integer totalPages,
+        @Param("totalChunks") Integer totalChunks,
+        @Param("startedAt") java.time.Instant startedAt,
+        @Param("completedAt") java.time.Instant completedAt,
+        @Param("errorMessage") String errorMessage
+    );
+    
+    /**
+     * Update document status to PROCESSING using native SQL.
+     */
+    @Modifying
+    @Transactional
+    @Query(value = """
+        UPDATE documents 
+        SET processing_status = 'PROCESSING',
+            processing_started_at = :startedAt,
+            updated_at = NOW()
+        WHERE id = CAST(:documentId AS uuid)
+        """, nativeQuery = true)
+    int setProcessingStatus(@Param("documentId") UUID documentId, @Param("startedAt") java.time.Instant startedAt);
+    
+    /**
+     * Update document status to COMPLETED using native SQL.
+     */
+    @Modifying
+    @Transactional
+    @Query(value = """
+        UPDATE documents 
+        SET processing_status = 'COMPLETED',
+            total_pages = :totalPages,
+            total_chunks = :totalChunks,
+            processing_completed_at = :completedAt,
+            error_message = NULL,
+            updated_at = NOW()
+        WHERE id = CAST(:documentId AS uuid)
+        """, nativeQuery = true)
+    int setCompletedStatus(
+        @Param("documentId") UUID documentId,
+        @Param("totalPages") Integer totalPages,
+        @Param("totalChunks") Integer totalChunks,
+        @Param("completedAt") java.time.Instant completedAt
+    );
+    
+    /**
+     * Update document status to FAILED using native SQL.
+     */
+    @Modifying
+    @Transactional
+    @Query(value = """
+        UPDATE documents 
+        SET processing_status = 'FAILED',
+            error_message = :errorMessage,
+            updated_at = NOW()
+        WHERE id = CAST(:documentId AS uuid)
+        """, nativeQuery = true)
+    int setFailedStatus(@Param("documentId") UUID documentId, @Param("errorMessage") String errorMessage);
+    
 }
 

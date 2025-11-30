@@ -6,7 +6,6 @@ import jakarta.persistence.PersistenceContext;
 import jakarta.persistence.Query;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Repository;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -165,7 +164,7 @@ public class DocumentChunkRepositoryImpl implements DocumentChunkRepositoryCusto
     }
     
     @Override
-    @Transactional  // Required for native SQL executeUpdate() calls
+    // Transaction is managed by the calling service method (DocumentProcessingService.saveChunksAndComplete)
     public void batchSaveChunksWithEmbeddings(List<DocumentChunk> chunks) {
         if (chunks == null || chunks.isEmpty()) {
             return;

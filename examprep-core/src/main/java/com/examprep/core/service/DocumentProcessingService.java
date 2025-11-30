@@ -112,6 +112,7 @@ public class DocumentProcessingService {
     
     @Transactional
     private Document initializeProcessing(UUID documentId) {
+        // Load document once to get basic info (but don't load related entities)
         Document document = documentRepository.findById(documentId)
             .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
         
@@ -119,30 +120,38 @@ public class DocumentProcessingService {
         chunkRepository.deleteByDocumentId(documentId);
         log.debug("Deleted existing chunks for document: {}", documentId);
         
-        // Update status to PROCESSING
-        document.setProcessingStatus(ProcessingStatus.PROCESSING);
-        document.setProcessingStartedAt(java.time.Instant.now());
-        documentRepository.save(document);
+        // Update status to PROCESSING using native SQL to avoid loading related entities
+        int updated = documentRepository.setProcessingStatus(documentId, java.time.Instant.now());
+        if (updated == 0) {
+            throw new RuntimeException("Document not found or could not be updated: " + documentId);
+        }
+        log.debug("Updated document {} status to PROCESSING via native SQL", documentId);
         
         return document;
     }
     
     @Transactional
     private void saveChunksAndComplete(UUID documentId, List<DocumentChunk> chunks, int totalPages) {
-        Document document = documentRepository.findById(documentId)
-            .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
-        
         // Use native SQL batch insert to avoid Hibernate vector mapping issues
         com.examprep.data.repository.DocumentChunkRepositoryCustom customRepo = 
             (com.examprep.data.repository.DocumentChunkRepositoryCustom) chunkRepository;
         customRepo.batchSaveChunksWithEmbeddings(chunks);
         
-        // Update document status
-        document.setTotalPages(totalPages);
-        document.setTotalChunks(chunks.size());
-        document.setProcessingStatus(ProcessingStatus.COMPLETED);
-        document.setProcessingCompletedAt(java.time.Instant.now());
-        documentRepository.save(document);
+        // Update document status using native SQL to avoid loading entity and related chunks with vector fields
+        int updated = documentRepository.setCompletedStatus(
+            documentId,
+            totalPages,
+            chunks.size(),
+            java.time.Instant.now()
+        );
+        
+        if (updated == 0) {
+            log.warn("Document {} not found when trying to mark as COMPLETED. Chunks were saved but document status was not updated.", documentId);
+            throw new RuntimeException("Document not found: " + documentId);
+        }
+        
+        log.debug("Updated document {} status to COMPLETED via native SQL ({} chunks, {} pages)", 
+            documentId, chunks.size(), totalPages);
     }
     
     /**
@@ -180,11 +189,19 @@ public class DocumentProcessingService {
     
     @Transactional
     private void markAsFailed(UUID documentId, String errorMessage) {
-        Document document = documentRepository.findById(documentId)
-            .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
-        document.setProcessingStatus(ProcessingStatus.FAILED);
-        document.setErrorMessage(errorMessage);
-        documentRepository.save(document);
+        // Use native SQL update to avoid loading entity and related chunks with vector fields
+        String truncatedError = errorMessage != null && errorMessage.length() > 2000 
+            ? errorMessage.substring(0, 2000) 
+            : errorMessage;
+        
+        int updated = documentRepository.setFailedStatus(documentId, truncatedError);
+        
+        if (updated == 0) {
+            log.warn("Document {} not found when trying to mark as FAILED. Error message: {}", documentId, truncatedError);
+            // Don't throw exception - document might have been deleted, just log it
+        } else {
+            log.debug("Updated document {} status to FAILED via native SQL", documentId);
+        }
     }
     
     private String computeHash(String content) {

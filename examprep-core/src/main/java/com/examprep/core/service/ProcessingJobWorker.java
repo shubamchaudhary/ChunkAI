@@ -1,7 +1,5 @@
 package com.examprep.core.service;
 
-import com.examprep.common.constants.ProcessingStatus;
-import com.examprep.data.entity.Document;
 import com.examprep.data.entity.ProcessingJob;
 import com.examprep.data.repository.DocumentRepository;
 import com.examprep.data.repository.ProcessingJobRepository;
@@ -132,8 +130,11 @@ public class ProcessingJobWorker {
         managedJob.setLockedUntil(Instant.now().plusSeconds(LOCK_DURATION_SECONDS));
         managedJob.setStartedAt(Instant.now());
         managedJob.setAttempts(managedJob.getAttempts() + 1);
-        jobRepository.save(managedJob);
+        // Use saveAndFlush to ensure job is immediately visible to other transactions (like error handler)
+        // This prevents "Job not found" errors when handleJobFailure runs in a separate transaction
+        jobRepository.saveAndFlush(managedJob);
         
+        log.debug("Job {} locked and flushed to database (document {} will be updated in separate transaction)", jobId, documentId);
         return documentId;
     }
     
@@ -177,15 +178,16 @@ public class ProcessingJobWorker {
                 failedJob.setLockedBy(null);
                 jobRepository.save(failedJob);
                 
-                // Update document status in same transaction
+                // Update document status using native SQL to avoid loading entity with chunks
                 if (documentId != null) {
                     try {
-                        Document document = documentRepository.findById(documentId)
-                            .orElseThrow(() -> new RuntimeException("Document not found: " + documentId));
-                        document.setProcessingStatus(ProcessingStatus.FAILED);
-                        document.setErrorMessage("Processing failed after " + failedJob.getAttempts() + " attempts: " + errorMessage);
-                        documentRepository.save(document);
-                        log.info("Marked document {} as FAILED due to job failure", documentId);
+                        String docErrorMessage = "Processing failed after " + failedJob.getAttempts() + " attempts: " + errorMessage;
+                        int updated = documentRepository.setFailedStatus(documentId, docErrorMessage);
+                        if (updated > 0) {
+                            log.info("Marked document {} as FAILED due to job failure", documentId);
+                        } else {
+                            log.warn("Document {} not found when trying to mark as FAILED", documentId);
+                        }
                     } catch (Exception docEx) {
                         log.error("Failed to update document {} status, but job {} marked as FAILED", documentId, jobId, docEx);
                         // Don't rethrow - job status is more important
