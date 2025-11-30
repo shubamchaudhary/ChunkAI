@@ -12,8 +12,10 @@
 
 ### Files Changed
 - `examprep-data/src/main/java/com/examprep/data/repository/DocumentChunkRepositoryCustom.java` - Added interface method
-- `examprep-data/src/main/java/com/examprep/data/repository/DocumentChunkRepositoryImpl.java` - Implemented native SQL batch insert
+- `examprep-data/src/main/java/com/examprep/data/repository/DocumentChunkRepositoryImpl.java` - Implemented native SQL batch insert with `@Transactional` annotation
 - `examprep-core/src/main/java/com/examprep/core/service/DocumentProcessingService.java` - Uses new batch insert method
+
+**Important Note**: The `batchSaveChunksWithEmbeddings()` method requires `@Transactional` annotation because native SQL `executeUpdate()` calls need an explicit transaction context. Without it, you'll get `jakarta.persistence.TransactionRequiredException`.
 
 ---
 
