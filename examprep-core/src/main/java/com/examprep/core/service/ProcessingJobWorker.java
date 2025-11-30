@@ -62,12 +62,14 @@ public class ProcessingJobWorker {
                 .map(jobId -> CompletableFuture.runAsync(() -> processJobById(jobId), executorService))
                 .collect(Collectors.toList());
             
-            // Wait for all to complete (but don't block the scheduler)
+            // Wait for all jobs to complete before releasing locks
+            // This prevents the scheduler from picking up the same jobs again
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                 .exceptionally(ex -> {
                     log.error("Error in batch processing", ex);
                     return null;
-                });
+                })
+                .join(); // Block until all jobs are done
             
         } catch (Exception e) {
             log.error("Error in processing job worker", e);
