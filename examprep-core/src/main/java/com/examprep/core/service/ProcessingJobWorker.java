@@ -36,10 +36,10 @@ public class ProcessingJobWorker {
     private static final ExecutorService executorService = Executors.newFixedThreadPool(BATCH_SIZE);
     
     @Scheduled(fixedDelay = 3000) // Run every 3 seconds
-    @Transactional // Required for repository queries with @Lock
     public void processQueuedJobs() {
         try {
-            List<ProcessingJob> queuedJobs = jobRepository.findNextQueuedJob(Instant.now());
+            // Fetch jobs in a short transaction (don't hold it during processing!)
+            List<ProcessingJob> queuedJobs = fetchQueuedJobs();
             
             if (queuedJobs.isEmpty()) {
                 return;
@@ -76,20 +76,24 @@ public class ProcessingJobWorker {
         }
     }
     
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional
+    private List<ProcessingJob> fetchQueuedJobs() {
+        // Fetch jobs with pessimistic lock in a SHORT transaction
+        // Transaction commits immediately after this method returns
+        return jobRepository.findNextQueuedJob(Instant.now());
+    }
+
     private void processJobById(UUID jobId) {
-        // Load job within new transaction to avoid lazy loading issues
-        ProcessingJob job = jobRepository.findById(jobId)
-            .orElseThrow(() -> new RuntimeException("Job not found: " + jobId));
-        processJob(job);
+        // Process job without holding a transaction open
+        // All DB operations are in nested methods with their own REQUIRES_NEW transactions
+        processJob(jobId);
     }
     
     /**
      * Process job - split transaction boundaries to avoid connection leaks
      * API calls are outside transactions
      */
-    private void processJob(ProcessingJob job) {
-        UUID jobId = job.getId();
+    private void processJob(UUID jobId) {
         UUID documentId = null;
         try {
             // Lock job in transaction
