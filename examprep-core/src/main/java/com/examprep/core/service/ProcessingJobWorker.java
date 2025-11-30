@@ -5,6 +5,7 @@ import com.examprep.data.repository.DocumentRepository;
 import com.examprep.data.repository.ProcessingJobRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
@@ -35,18 +36,18 @@ public class ProcessingJobWorker {
     private static final int BATCH_SIZE = 10; // Process 10 jobs in parallel (optimized for throughput)
     private static final ExecutorService executorService = Executors.newFixedThreadPool(BATCH_SIZE);
 
-    // Constructor with self-injection for transaction proxying
+    // Constructor with lazy self-injection to break circular dependency
     public ProcessingJobWorker(
         ProcessingJobRepository jobRepository,
         DocumentRepository documentRepository,
         DocumentProcessingService documentProcessingService,
-        org.springframework.context.ApplicationContext applicationContext
+        @Lazy ProcessingJobWorker self
     ) {
         this.jobRepository = jobRepository;
         this.documentRepository = documentRepository;
         this.documentProcessingService = documentProcessingService;
-        // Self-inject to enable transaction proxying for internal method calls
-        this.self = applicationContext.getBean(ProcessingJobWorker.class);
+        // Lazy self-inject to enable transaction proxying without circular dependency
+        this.self = self;
     }
 
     @Scheduled(fixedDelay = 3000) // Run every 3 seconds
