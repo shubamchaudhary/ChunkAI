@@ -21,12 +21,16 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class DocumentProcessingService {
-    
+
     private final DocumentRepository documentRepository;
     private final DocumentChunkRepository chunkRepository;
     private final DocumentProcessorFactory processorFactory;
@@ -34,6 +38,10 @@ public class DocumentProcessingService {
     private final EmbeddingService embeddingService;
     private final FileStorageService fileStorageService;
     private final com.examprep.llm.keymanager.ApiKeyManager apiKeyManager;
+
+    // Thread pool for parallel chunk embedding (reused across all documents)
+    private static final int CHUNK_PARALLEL_THREADS = 20; // Process 20 chunks in parallel per document
+    private static final ExecutorService chunkExecutor = Executors.newFixedThreadPool(CHUNK_PARALLEL_THREADS);
     
     /**
      * Process document - split into transaction boundaries to avoid connection leaks
@@ -68,34 +76,45 @@ public class DocumentProcessingService {
             int numKeys = apiKeyManager.getKeyCount();
             int assignedKeyIndex = Math.abs(documentId.hashCode()) % numKeys;
             
-            log.info("Processing document {} with API key {} ({} chunks)", 
+            log.info("Processing document {} with API key {} ({} chunks)",
                 document.getFileName(), assignedKeyIndex + 1, chunks.size());
-            
+
             // Generate embeddings OUTSIDE transaction using assigned API key (API calls can take minutes)
-            List<DocumentChunk> documentChunks = new java.util.ArrayList<>();
+            // Process chunks in PARALLEL for massive speedup (20 chunks at a time)
             UUID userId = document.getUser().getId();
             UUID chatId = document.getChat().getId();
-            
-            for (ChunkingResult chunk : chunks) {
-                // Use assigned API key for all chunks in this document
-                float[] embedding = embeddingService.generateEmbedding(chunk.getContent(), assignedKeyIndex);
-                
-                DocumentChunk documentChunk = DocumentChunk.builder()
-                    .document(document)
-                    .userId(userId)
-                    .chatId(chatId)
-                    .chunkIndex(chunk.getChunkIndex())
-                    .content(chunk.getContent())
-                    .contentHash(computeHash(chunk.getContent()))
-                    .pageNumber(chunk.getPageNumber())
-                    .slideNumber(chunk.getSlideNumber())
-                    .sectionTitle(chunk.getSectionTitle())
-                    .embedding(embedding)
-                    .tokenCount(chunk.getTokenCount())
-                    .build();
-                
-                documentChunks.add(documentChunk);
-            }
+
+            List<CompletableFuture<DocumentChunk>> chunkFutures = chunks.stream()
+                .map(chunk -> CompletableFuture.supplyAsync(() -> {
+                    try {
+                        // Use assigned API key for all chunks in this document
+                        float[] embedding = embeddingService.generateEmbedding(chunk.getContent(), assignedKeyIndex);
+
+                        return DocumentChunk.builder()
+                            .document(document)
+                            .userId(userId)
+                            .chatId(chatId)
+                            .chunkIndex(chunk.getChunkIndex())
+                            .content(chunk.getContent())
+                            .contentHash(computeHash(chunk.getContent()))
+                            .pageNumber(chunk.getPageNumber())
+                            .slideNumber(chunk.getSlideNumber())
+                            .sectionTitle(chunk.getSectionTitle())
+                            .embedding(embedding)
+                            .tokenCount(chunk.getTokenCount())
+                            .build();
+                    } catch (Exception e) {
+                        log.error("Failed to process chunk {} for document {}: {}",
+                            chunk.getChunkIndex(), documentId, e.getMessage());
+                        throw new RuntimeException("Chunk processing failed", e);
+                    }
+                }, chunkExecutor))
+                .collect(Collectors.toList());
+
+            // Wait for all chunk embeddings to complete
+            List<DocumentChunk> documentChunks = chunkFutures.stream()
+                .map(CompletableFuture::join)
+                .collect(Collectors.toList());
             
             // Save all chunks in a single transaction (batch save)
             saveChunksAndComplete(documentId, documentChunks, extractionResult.getTotalPages());

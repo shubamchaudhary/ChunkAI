@@ -18,7 +18,7 @@ public class EmbeddingService {
     private final ApiKeyManager apiKeyManager;
     
     // Per-key rate limiting: track last request time for each API key separately
-    private static final long EMBEDDING_DELAY_MS = 300; // 300ms delay between requests per key
+    private static final long EMBEDDING_DELAY_MS = 100; // 100ms delay between requests per key (Gemini can handle 10 req/sec per key)
     private static final java.util.concurrent.ConcurrentHashMap<Integer, Long> lastRequestTimeByKeyIndex = new java.util.concurrent.ConcurrentHashMap<>();
     
     /**

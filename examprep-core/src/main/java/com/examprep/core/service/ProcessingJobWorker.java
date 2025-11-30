@@ -32,7 +32,7 @@ public class ProcessingJobWorker {
     
     private static final String WORKER_ID = "worker-" + UUID.randomUUID().toString().substring(0, 8);
     private static final int LOCK_DURATION_SECONDS = 300; // 5 minutes
-    private static final int BATCH_SIZE = 5; // Process 5 jobs in parallel (balanced for speed vs rate limits)
+    private static final int BATCH_SIZE = 10; // Process 10 jobs in parallel (optimized for throughput)
     private static final ExecutorService executorService = Executors.newFixedThreadPool(BATCH_SIZE);
     
     @Scheduled(fixedDelay = 3000) // Run every 3 seconds
