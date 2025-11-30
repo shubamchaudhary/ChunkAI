@@ -22,24 +22,39 @@ import java.util.stream.Collectors;
  * Background worker that processes queued document processing jobs in parallel batches
  */
 @Component
-@RequiredArgsConstructor
 @Slf4j
 public class ProcessingJobWorker {
-    
+
     private final ProcessingJobRepository jobRepository;
     private final DocumentRepository documentRepository;
     private final DocumentProcessingService documentProcessingService;
-    
+    private final ProcessingJobWorker self;
+
     private static final String WORKER_ID = "worker-" + UUID.randomUUID().toString().substring(0, 8);
     private static final int LOCK_DURATION_SECONDS = 300; // 5 minutes
     private static final int BATCH_SIZE = 10; // Process 10 jobs in parallel (optimized for throughput)
     private static final ExecutorService executorService = Executors.newFixedThreadPool(BATCH_SIZE);
-    
+
+    // Constructor with self-injection for transaction proxying
+    public ProcessingJobWorker(
+        ProcessingJobRepository jobRepository,
+        DocumentRepository documentRepository,
+        DocumentProcessingService documentProcessingService,
+        org.springframework.context.ApplicationContext applicationContext
+    ) {
+        this.jobRepository = jobRepository;
+        this.documentRepository = documentRepository;
+        this.documentProcessingService = documentProcessingService;
+        // Self-inject to enable transaction proxying for internal method calls
+        this.self = applicationContext.getBean(ProcessingJobWorker.class);
+    }
+
     @Scheduled(fixedDelay = 3000) // Run every 3 seconds
     public void processQueuedJobs() {
         try {
             // Fetch jobs in a short transaction (don't hold it during processing!)
-            List<ProcessingJob> queuedJobs = fetchQueuedJobs();
+            // Call through self to trigger Spring's transaction proxy
+            List<ProcessingJob> queuedJobs = self.fetchQueuedJobs();
             
             if (queuedJobs.isEmpty()) {
                 return;
@@ -76,10 +91,11 @@ public class ProcessingJobWorker {
         }
     }
     
-    @Transactional
-    private List<ProcessingJob> fetchQueuedJobs() {
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public List<ProcessingJob> fetchQueuedJobs() {
         // Fetch jobs with pessimistic lock in a SHORT transaction
         // Transaction commits immediately after this method returns
+        // Must be public for Spring's transaction proxy to work
         return jobRepository.findNextQueuedJob(Instant.now());
     }
 
