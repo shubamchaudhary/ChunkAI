@@ -2,126 +2,180 @@ package com.examprep.llm.service;
 
 import com.examprep.llm.client.GeminiClient;
 import com.examprep.llm.keymanager.ApiKeyManager;
-import lombok.RequiredArgsConstructor;
+import com.examprep.llm.ratelimit.RateLimitedApiKeyManager;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
+/**
+ * Enhanced Embedding Service with Batch Support and Intelligent Rate Limiting
+ *
+ * This service provides two modes of operation:
+ * 1. SINGLE EMBEDDING: For individual text chunks (uses token bucket rate limiting)
+ * 2. BATCH EMBEDDING: For multiple texts (20x more efficient via batch API)
+ *
+ * RECOMMENDED USAGE:
+ * ==================
+ * - For documents: Use batch methods (generateEmbeddingsParallel)
+ * - For queries: Use single method (generateEmbedding)
+ *
+ * The service automatically:
+ * - Distributes load across all configured API keys
+ * - Handles rate limiting with token bucket algorithm
+ * - Retries on failures with exponential backoff
+ * - Disables failing keys temporarily
+ */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class EmbeddingService {
-    
+
     private final GeminiClient geminiClient;
-    private final ApiKeyManager apiKeyManager;
-    
-    // Per-key rate limiting: track last request time for each API key separately
-    private static final long EMBEDDING_DELAY_MS = 100; // 100ms delay between requests per key (Gemini can handle 10 req/sec per key)
-    private static final java.util.concurrent.ConcurrentHashMap<Integer, Long> lastRequestTimeByKeyIndex = new java.util.concurrent.ConcurrentHashMap<>();
-    
+    private final ApiKeyManager legacyApiKeyManager;
+    private final RateLimitedApiKeyManager rateLimitedApiKeyManager;
+    private final BatchEmbeddingService batchEmbeddingService;
+
+    @Autowired
+    public EmbeddingService(
+            GeminiClient geminiClient,
+            ApiKeyManager apiKeyManager,
+            RateLimitedApiKeyManager rateLimitedApiKeyManager,
+            @Autowired(required = false) BatchEmbeddingService batchEmbeddingService) {
+        this.geminiClient = geminiClient;
+        this.legacyApiKeyManager = apiKeyManager;
+        this.rateLimitedApiKeyManager = rateLimitedApiKeyManager;
+        this.batchEmbeddingService = batchEmbeddingService;
+
+        log.info("EmbeddingService initialized with {} API keys, batch support: {}",
+            rateLimitedApiKeyManager.getKeyCount(),
+            batchEmbeddingService != null ? "ENABLED" : "DISABLED");
+    }
+
     /**
-     * Generate embedding for a single text with automatic retry on leaked keys
-     * Uses round-robin key selection with per-key rate limiting
+     * Generate embedding for a single text using rate-limited key selection
+     * Best for: Query embeddings, single text processing
      */
     public float[] generateEmbedding(String text) {
         log.debug("Generating embedding for text of length: {}", text.length());
-        
-        // Try with round-robin key first
-        String apiKey = apiKeyManager.getNextApiKey();
-        int keyIndex = findKeyIndex(apiKey);
-        int maxRetries = apiKeyManager.getKeyCount();
-        int attempts = 0;
-        
-        while (attempts < maxRetries) {
+
+        int maxRetries = rateLimitedApiKeyManager.getKeyCount();
+        Exception lastException = null;
+
+        for (int attempt = 0; attempt < maxRetries; attempt++) {
+            String apiKey = rateLimitedApiKeyManager.getNextKey();
+
             try {
-                // Per-key rate limiting: only delay if same key was used recently
-                enforceRateLimit(keyIndex);
-                return geminiClient.generateEmbedding(text, apiKey);
+                float[] embedding = geminiClient.generateEmbedding(text, apiKey);
+                rateLimitedApiKeyManager.reportKeySuccess(apiKey);
+                return embedding;
+
             } catch (RuntimeException e) {
-                // Check if it's a leaked key error
-                if (e.getMessage() != null && e.getMessage().contains("leaked")) {
-                    log.warn("API key {} reported as leaked, trying next key (attempt {}/{})", 
-                        keyIndex, attempts + 1, maxRetries);
-                    attempts++;
-                    if (attempts < maxRetries) {
-                        apiKey = apiKeyManager.getNextApiKey(); // Try next key
-                        keyIndex = findKeyIndex(apiKey);
-                        continue;
-                    }
+                lastException = e;
+                String errorMessage = e.getMessage() != null ? e.getMessage() : "Unknown error";
+
+                // Categorize error
+                String errorType = categorizeError(errorMessage);
+                rateLimitedApiKeyManager.reportKeyFailure(apiKey, errorType, errorMessage);
+
+                log.warn("Embedding failed with key (attempt {}/{}): {} - {}",
+                    attempt + 1, maxRetries, errorType, errorMessage);
+
+                // If it's a leaked key, try next immediately
+                if (errorMessage.contains("leaked")) {
+                    continue;
                 }
-                // If not leaked error or all keys exhausted, throw
-                throw e;
+
+                // For rate limits, the key manager will handle waiting
+                if (errorType.contains("429")) {
+                    continue;
+                }
+
+                // For other errors, don't retry with same key
+                if (attempt < maxRetries - 1) {
+                    continue;
+                }
             }
         }
-        
-        throw new RuntimeException("All API keys failed. Please check GEMINI_API_KEYS environment variable.");
+
+        throw new RuntimeException("All API keys failed after " + maxRetries + " attempts. " +
+            "Status: " + rateLimitedApiKeyManager.getKeyHealthSummary(),
+            lastException);
     }
-    
+
     /**
-     * Generate embedding using a specific API key (for parallel processing across keys)
+     * Generate embedding using document-bound key (for consistent key assignment)
+     * Best for: Document processing where all chunks should use same key
+     */
+    public float[] generateEmbedding(String text, UUID documentId) {
+        log.debug("Generating embedding for document {} text of length: {}", documentId, text.length());
+
+        String apiKey = rateLimitedApiKeyManager.getKeyForDocument(documentId);
+
+        try {
+            float[] embedding = geminiClient.generateEmbedding(text, apiKey);
+            rateLimitedApiKeyManager.reportKeySuccess(apiKey);
+            return embedding;
+
+        } catch (RuntimeException e) {
+            String errorMessage = e.getMessage() != null ? e.getMessage() : "Unknown error";
+            String errorType = categorizeError(errorMessage);
+            rateLimitedApiKeyManager.reportKeyFailure(apiKey, errorType, errorMessage);
+
+            // Fall back to any available key
+            log.warn("Document-bound key failed, falling back to general pool");
+            return generateEmbedding(text);
+        }
+    }
+
+    /**
+     * Generate embedding using a specific key index (legacy compatibility)
      */
     public float[] generateEmbedding(String text, int keyIndex) {
-        log.debug("Generating embedding for text of length: {} using API key {}", text.length(), keyIndex);
-        
-        String apiKey = apiKeyManager.getApiKey(keyIndex);
-        
-        // Per-key rate limiting
-        enforceRateLimit(keyIndex);
-        
+        log.debug("Generating embedding for text of length: {} using key index {}", text.length(), keyIndex);
+
+        String apiKey = legacyApiKeyManager.getApiKey(keyIndex);
         return geminiClient.generateEmbedding(text, apiKey);
     }
-    
-    private void enforceRateLimit(int keyIndex) {
-        long currentTime = System.currentTimeMillis();
-        Long lastTime = lastRequestTimeByKeyIndex.get(keyIndex);
-        
-        if (lastTime != null) {
-            long timeSinceLastRequest = currentTime - lastTime;
-            if (timeSinceLastRequest < EMBEDDING_DELAY_MS) {
-                try {
-                    Thread.sleep(EMBEDDING_DELAY_MS - timeSinceLastRequest);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-        }
-        
-        lastRequestTimeByKeyIndex.put(keyIndex, System.currentTimeMillis());
-    }
-    
-    private int findKeyIndex(String apiKey) {
-        List<String> allKeys = apiKeyManager.getAllApiKeys();
-        for (int i = 0; i < allKeys.size(); i++) {
-            if (allKeys.get(i).equals(apiKey)) {
-                return i;
-            }
-        }
-        return 0; // Default to first key if not found
-    }
-    
+
     /**
-     * Generate embeddings for multiple texts (batch processing)
+     * Generate embeddings for multiple texts using BATCH API (20x faster!)
+     * Best for: Document processing with many chunks
+     *
+     * @param texts List of texts to embed
+     * @return List of embeddings in same order
      */
     public List<float[]> generateEmbeddings(List<String> texts) {
-        log.info("Generating embeddings for {} texts", texts.size());
-        
-        List<float[]> embeddings = new ArrayList<>();
-        for (String text : texts) {
-            embeddings.add(generateEmbedding(text));
-            
-            // Rate limiting - simple delay between requests
-            try {
-                Thread.sleep(100); // 100ms between requests
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+        if (batchEmbeddingService != null) {
+            log.info("Using batch embedding for {} texts", texts.size());
+            return batchEmbeddingService.generateEmbeddings(texts);
         }
-        
-        return embeddings;
+
+        // Fallback to sequential processing
+        log.warn("Batch embedding not available, falling back to sequential processing");
+        return texts.stream()
+            .map(this::generateEmbedding)
+            .toList();
     }
-    
+
+    /**
+     * Generate embeddings in parallel using batch API across multiple keys
+     * Best for: Large documents, high-throughput scenarios
+     *
+     * @param texts List of texts to embed
+     * @return List of embeddings in same order
+     */
+    public List<float[]> generateEmbeddingsParallel(List<String> texts) {
+        if (batchEmbeddingService != null) {
+            log.info("Using PARALLEL batch embedding for {} texts", texts.size());
+            return batchEmbeddingService.generateEmbeddingsParallel(texts);
+        }
+
+        // Fallback to regular batch
+        return generateEmbeddings(texts);
+    }
+
     /**
      * Convert float array to pgvector format string
      */
@@ -135,6 +189,30 @@ public class EmbeddingService {
         }
         sb.append("]");
         return sb.toString();
+    }
+
+    /**
+     * Get current API key health status (for monitoring)
+     */
+    public List<RateLimitedApiKeyManager.KeyHealthStatus> getKeyHealth() {
+        return rateLimitedApiKeyManager.getKeyHealth();
+    }
+
+    /**
+     * Categorize error for key manager reporting
+     */
+    private String categorizeError(String errorMessage) {
+        if (errorMessage == null) return "UNKNOWN";
+        String lower = errorMessage.toLowerCase();
+
+        if (lower.contains("429") || lower.contains("rate")) return "429_RATE_LIMIT";
+        if (lower.contains("403") || lower.contains("forbidden")) return "403_FORBIDDEN";
+        if (lower.contains("401") || lower.contains("unauthorized")) return "401_UNAUTHORIZED";
+        if (lower.contains("leaked")) return "KEY_LEAKED";
+        if (lower.contains("timeout")) return "TIMEOUT";
+        if (lower.contains("connection")) return "CONNECTION_ERROR";
+
+        return "UNKNOWN";
     }
 }
 
