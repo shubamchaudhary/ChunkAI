@@ -39,8 +39,6 @@ public class SecurityConfig {
             .authorizeHttpRequests(auth -> auth
                 .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll() // Allow all OPTIONS requests for CORS preflight
                 .requestMatchers("/api/v1/auth/**").permitAll()
-                .requestMatchers("/api/v1/health/**").permitAll() // Health endpoints for keep-alive
-                .requestMatchers("/actuator/health").permitAll() // Actuator health endpoint
                 .requestMatchers("/swagger-ui/**", "/v3/api-docs/**").permitAll()
                 .anyRequest().authenticated()
             )
