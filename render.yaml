@@ -1,0 +1,44 @@
+# Render.com Blueprint Configuration
+# See: https://render.com/docs/blueprint-spec
+
+services:
+  # Backend API Service
+  - type: web
+    name: examprep-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: SPRING_PROFILES_ACTIVE
+        value: production
+      - key: PORT
+        value: 8080
+      - key: SPRING_DATASOURCE_URL
+        sync: false
+      - key: SPRING_DATASOURCE_USERNAME
+        sync: false
+      - key: SPRING_DATASOURCE_PASSWORD
+        sync: false
+      - key: GEMINI_API_KEYS
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: KEEPALIVE_ENABLED
+        value: "true"
+      - key: KEEPALIVE_URL
+        value: "https://examprep-api.onrender.com/api/v1/health/ping"
+      - key: KEEPALIVE_INTERVAL_MS
+        value: "840000"
+
+databases:
+  - name: examprep-db
+    plan: free
+    databaseName: examprep_db
+    user: examprep
+    region: oregon
+    postgresMajorVersion: "16"
+    ipAllowList: []

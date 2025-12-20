@@ -23,5 +23,16 @@ RUN addgroup -S spring && adduser -S spring -G spring
 USER spring:spring
 COPY --from=build /app/examprep-api/build/libs/examprep-api-1.0.0-SNAPSHOT.jar app.jar
 EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "app.jar"]
+# JVM optimizations for Render.com free tier (512MB RAM limit)
+# -XX:+UseContainerSupport: Respect container memory limits
+# -XX:MaxRAMPercentage=75: Use up to 75% of available RAM for heap
+# -XX:+UseG1GC: Use G1 garbage collector (better for limited memory)
+# -XX:+UseStringDeduplication: Reduce memory usage by deduplicating strings
+ENTRYPOINT ["java", \
+    "-XX:+UseContainerSupport", \
+    "-XX:MaxRAMPercentage=75.0", \
+    "-XX:+UseG1GC", \
+    "-XX:+UseStringDeduplication", \
+    "-Djava.security.egd=file:/dev/./urandom", \
+    "-jar", "app.jar"]
 
