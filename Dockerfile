@@ -24,15 +24,19 @@ USER spring:spring
 COPY --from=build /app/examprep-api/build/libs/examprep-api-1.0.0-SNAPSHOT.jar app.jar
 EXPOSE 8080
 # JVM optimizations for Render.com free tier (512MB RAM limit)
-# -XX:+UseContainerSupport: Respect container memory limits
-# -XX:MaxRAMPercentage=75: Use up to 75% of available RAM for heap
-# -XX:+UseG1GC: Use G1 garbage collector (better for limited memory)
-# -XX:+UseStringDeduplication: Reduce memory usage by deduplicating strings
+# Aggressive memory reduction settings:
+# - MaxRAMPercentage=50: Use only 50% of RAM for heap (~256MB)
+# - UseSerialGC: Lower memory overhead than G1GC for small heaps
+# - MaxMetaspaceSize: Limit metaspace to prevent growth
+# - ReservedCodeCacheSize: Limit JIT code cache
+# - Xss256k: Reduce thread stack size
 ENTRYPOINT ["java", \
     "-XX:+UseContainerSupport", \
-    "-XX:MaxRAMPercentage=75.0", \
-    "-XX:+UseG1GC", \
-    "-XX:+UseStringDeduplication", \
+    "-XX:MaxRAMPercentage=50.0", \
+    "-XX:+UseSerialGC", \
+    "-XX:MaxMetaspaceSize=128m", \
+    "-XX:ReservedCodeCacheSize=64m", \
+    "-Xss256k", \
     "-Djava.security.egd=file:/dev/./urandom", \
     "-jar", "app.jar"]
 

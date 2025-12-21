@@ -33,7 +33,7 @@ public class ProcessingJobWorker {
 
     private static final String WORKER_ID = "worker-" + UUID.randomUUID().toString().substring(0, 8);
     private static final int LOCK_DURATION_SECONDS = 300; // 5 minutes
-    private static final int BATCH_SIZE = 10; // Process 10 jobs in parallel (optimized for throughput)
+    private static final int BATCH_SIZE = 2; // Reduced from 10 to save memory on 512MB free tier
     private static final ExecutorService executorService = Executors.newFixedThreadPool(BATCH_SIZE);
 
     // Constructor with lazy self-injection to break circular dependency
