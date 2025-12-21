@@ -19,9 +19,10 @@ import java.time.Duration;
 @Configuration
 public class WebClientConfig {
 
-    // 16MB buffer - Gemini batch embedding responses can be large
-    // (20 embeddings × 768 dimensions × JSON overhead ≈ 1-2MB)
-    private static final int MAX_IN_MEMORY_SIZE = 16 * 1024 * 1024;
+    // 2MB buffer - sufficient for batch embedding responses
+    // (20 embeddings × 768 dimensions × JSON overhead ≈ 500KB-1MB)
+    // Reduced from 16MB to save memory on free tier
+    private static final int MAX_IN_MEMORY_SIZE = 2 * 1024 * 1024;
 
     @Bean
     public WebClient.Builder webClientBuilder() {

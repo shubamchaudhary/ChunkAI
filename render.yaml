@@ -30,7 +30,7 @@ services:
       - key: KEEPALIVE_ENABLED
         value: "true"
       - key: KEEPALIVE_URL
-        value: "https://examprep-api.onrender.com/api/v1/health/ping"
+        value: "https://chunkai.onrender.com/api/v1/health/ping"
       - key: KEEPALIVE_INTERVAL_MS
         value: "840000"
 

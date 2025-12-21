@@ -50,9 +50,9 @@ public class BatchEmbeddingService {
     private final WebClient.Builder webClientBuilder;
     private final RateLimitedApiKeyManager apiKeyManager;
 
-    // Batch configuration
-    private static final int BATCH_SIZE = 20;              // Texts per API call (Gemini limit is 100)
-    private static final int MAX_PARALLEL_BATCHES = 3;     // Process 3 batches in parallel (one per key)
+    // Batch configuration - optimized for 512MB memory limit
+    private static final int BATCH_SIZE = 10;              // Reduced from 20 to save memory
+    private static final int MAX_PARALLEL_BATCHES = 1;     // Sequential processing to minimize memory
     private static final int MAX_RETRIES = 3;              // Retry failed batches
     private static final long RETRY_DELAY_MS = 2000;       // 2 second between retries
 
