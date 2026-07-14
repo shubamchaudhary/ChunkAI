@@ -16,4 +16,13 @@ public final class KafkaTopics {
 
     /** Dead letters from the ingest lane (poison ingest requests). */
     public static final String LOG_INGEST_DLQ = "log.ingest.dlq";
+
+    /** LLM enrichment/embedding work items. Partition == API-key slot. */
+    public static final String LLM_ENRICH_REQUESTS = "llm.enrich.requests";
+
+    /** 429-throttled work items, re-released to the main topic after a delay. */
+    public static final String LLM_ENRICH_RETRY_60S = "llm.enrich.retry.60s";
+
+    /** Dead letters from the enrichment lane (exhausted retries / poison work). */
+    public static final String LLM_ENRICH_DLQ = "llm.enrich.dlq";
 }

@@ -9,7 +9,9 @@ import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -92,5 +94,57 @@ public class MetricsWriter {
                 return rows.size();
             }
         });
+    }
+
+    /**
+     * Compact, human-readable metric lines for the window(s) covered by
+     * {@code buckets} — fed to the enrichment prompt as the authoritative,
+     * parser-extracted context so the model explains numbers it cannot see in the
+     * raw lines alone. Queried as a {@code [min,max]} bucket range (for a single
+     * window min == max, i.e. that exact minute).
+     */
+    public List<String> metricContext(UUID sessionId, List<Instant> buckets) {
+        if (buckets == null || buckets.isEmpty()) {
+            return List.of();
+        }
+        Instant min = buckets.get(0);
+        Instant max = buckets.get(0);
+        for (Instant b : buckets) {
+            if (b.isBefore(min)) {
+                min = b;
+            }
+            if (b.isAfter(max)) {
+                max = b;
+            }
+        }
+        final OffsetDateTime lo = min.atOffset(ZoneOffset.UTC);
+        final OffsetDateTime hi = max.atOffset(ZoneOffset.UTC);
+        String sql = "SELECT category, metric, count, avg_ms, p95_ms FROM log_metrics " +
+            "WHERE session_id = ? AND time_bucket >= ? AND time_bucket <= ? ORDER BY category, metric";
+
+        List<String> lines = new ArrayList<>();
+        jdbc.query(
+            con -> {
+                PreparedStatement ps = con.prepareStatement(sql);
+                ps.setObject(1, sessionId);
+                ps.setObject(2, lo);
+                ps.setObject(3, hi);
+                return ps;
+            },
+            rs -> {
+                StringBuilder sb = new StringBuilder();
+                sb.append(rs.getString("category")).append('.').append(rs.getString("metric"))
+                    .append(" count=").append(rs.getLong("count"));
+                java.math.BigDecimal avg = rs.getBigDecimal("avg_ms");
+                if (avg != null) {
+                    sb.append(" avg=").append(avg.stripTrailingZeros().toPlainString()).append("ms");
+                }
+                java.math.BigDecimal p95 = rs.getBigDecimal("p95_ms");
+                if (p95 != null) {
+                    sb.append(" p95=").append(p95.stripTrailingZeros().toPlainString()).append("ms");
+                }
+                lines.add(sb.toString());
+            });
+        return lines;
     }
 }

@@ -58,6 +58,7 @@ public class KafkaConsumerConfig {
     private static String dlqTopicFor(String sourceTopic) {
         return switch (sourceTopic) {
             case KafkaTopics.LOG_INGEST_REQUESTS -> KafkaTopics.LOG_INGEST_DLQ;
+            case KafkaTopics.LLM_ENRICH_REQUESTS, KafkaTopics.LLM_ENRICH_RETRY_60S -> KafkaTopics.LLM_ENRICH_DLQ;
             default -> sourceTopic + ".dlq";
         };
     }

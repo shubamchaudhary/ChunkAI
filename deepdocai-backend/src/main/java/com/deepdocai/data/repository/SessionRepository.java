@@ -38,4 +38,15 @@ public interface SessionRepository extends JpaRepository<Session, UUID> {
     @Query("update Session s set s.analysisStatus = com.deepdocai.common.constants.AnalysisStatus.FAILED, "
         + "s.errorMessage = :message where s.id = :id")
     void setFailed(@Param("id") UUID id, @Param("message") String message);
+
+    /**
+     * Atomically advance a fully-enriched session from ENRICHING to CORRELATING.
+     * Exactly one concurrent caller wins (returns 1) and is responsible for
+     * triggering correlation; the rest see 0 and stand down.
+     */
+    @Modifying
+    @Transactional
+    @Query("update Session s set s.analysisStatus = com.deepdocai.common.constants.AnalysisStatus.CORRELATING "
+        + "where s.id = :id and s.analysisStatus = com.deepdocai.common.constants.AnalysisStatus.ENRICHING")
+    int flipEnrichingToCorrelating(@Param("id") UUID id);
 }

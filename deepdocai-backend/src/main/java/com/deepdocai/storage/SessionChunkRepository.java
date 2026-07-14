@@ -5,11 +5,15 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.sql.Array;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -90,5 +94,80 @@ public class SessionChunkRepository {
     public void deleteByDocument(UUID sessionId, UUID documentId) {
         String table = tableManager.tableName(sessionId); // validated UUID → safe
         jdbc.update("DELETE FROM " + table + " WHERE document_id = ?", documentId);
+    }
+
+    /** A chunk's stored text plus its window bucket, for building enrichment prompts. */
+    public record ChunkContent(UUID chunkId, Instant timeBucket, String content) {
+    }
+
+    /**
+     * Load the given chunks (content + window bucket) from the session's table,
+     * returned in the same order as {@code chunkIds}. Missing ids are skipped.
+     */
+    public List<ChunkContent> readChunks(UUID sessionId, List<UUID> chunkIds) {
+        if (chunkIds == null || chunkIds.isEmpty()) {
+            return List.of();
+        }
+        String table = tableManager.tableName(sessionId); // validated UUID → safe
+        String sql = "SELECT chunk_id, time_bucket, content FROM " + table + " WHERE chunk_id = ANY(?)";
+
+        Map<UUID, ChunkContent> byId = new LinkedHashMap<>();
+        jdbc.query(
+            con -> {
+                PreparedStatement ps = con.prepareStatement(sql);
+                Array arr = con.createArrayOf("uuid", chunkIds.stream().map(UUID::toString).toArray());
+                ps.setArray(1, arr);
+                return ps;
+            },
+            rs -> {
+                UUID id = rs.getObject("chunk_id", UUID.class);
+                Instant bucket = rs.getObject("time_bucket", java.time.OffsetDateTime.class).toInstant();
+                byId.put(id, new ChunkContent(id, bucket, rs.getString("content")));
+            });
+
+        List<ChunkContent> ordered = new ArrayList<>(chunkIds.size());
+        for (UUID id : chunkIds) {
+            ChunkContent c = byId.get(id);
+            if (c != null) {
+                ordered.add(c);
+            }
+        }
+        return ordered;
+    }
+
+    /** A computed embedding for one chunk, as a pgvector text literal (e.g. {@code [0.1,...]}). */
+    public record ChunkEmbedding(UUID chunkId, String vectorLiteral) {
+    }
+
+    /**
+     * Batch-write embeddings into the session's chunk table. The vector is bound as
+     * text and cast to {@code vector} by Postgres. No-op for an empty list.
+     */
+    @Transactional
+    public int updateEmbeddings(UUID sessionId, List<ChunkEmbedding> embeddings) {
+        if (embeddings == null || embeddings.isEmpty()) {
+            return 0;
+        }
+        String table = tableManager.tableName(sessionId); // validated UUID → safe
+        String sql = "UPDATE " + table + " SET embedding = ?::vector WHERE chunk_id = ?";
+
+        int[] counts = jdbc.batchUpdate(sql, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                ChunkEmbedding e = embeddings.get(i);
+                ps.setString(1, e.vectorLiteral());
+                ps.setObject(2, e.chunkId());
+            }
+
+            @Override
+            public int getBatchSize() {
+                return embeddings.size();
+            }
+        });
+        int updated = 0;
+        for (int c : counts) {
+            updated += Math.max(c, 0);
+        }
+        return updated;
     }
 }

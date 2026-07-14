@@ -6,6 +6,8 @@ import com.deepdocai.common.messages.IngestRequest;
 import com.deepdocai.data.entity.Document;
 import com.deepdocai.data.repository.DocumentRepository;
 import com.deepdocai.data.repository.SessionRepository;
+import com.deepdocai.enrich.EnrichCompletion;
+import com.deepdocai.enrich.EnrichProducer;
 import com.deepdocai.ingest.model.LogWindow;
 import com.deepdocai.ingest.model.MetricRow;
 import com.deepdocai.ingest.parser.LogWindowParser;
@@ -56,6 +58,8 @@ public class IngestConsumer {
     private final AnomalyDetector anomalyDetector;
     private final MetricsWriter metricsWriter;
     private final SessionChunkRepository chunkRepository;
+    private final EnrichProducer enrichProducer;
+    private final EnrichCompletion enrichCompletion;
 
     @KafkaListener(topics = "#{T(com.deepdocai.common.constants.KafkaTopics).LOG_INGEST_REQUESTS}",
         groupId = "ingest-workers")
@@ -126,17 +130,27 @@ public class IngestConsumer {
         }
         metricsWriter.upsert(sessionId, metricRows);
 
-        sessionRepository.setTotalWindows(sessionId, windows.size());
+        // Enrichment fan-out: total_windows is the number of LLM work items (one
+        // per anomalous window + one per embedding batch), NOT the raw window
+        // count — that is what the Phase-3 completion counter counts down. Set it
+        // (and flip to ENRICHING) BEFORE producing so any fast consumer sees a
+        // correct target the moment items land.
+        int workItems = enrichProducer.workItemCount(windows);
+        sessionRepository.setTotalWindows(sessionId, workItems);
         sessionRepository.setStatus(sessionId, AnalysisStatus.ENRICHING);
-
-        // Phase 3 produces EnrichRequests here (one ENRICH_WINDOW per anomalous
-        // window + EMBED_BATCH batches). Until then the session rests at ENRICHING.
+        enrichProducer.produce(sessionId, windows);
 
         fileStorageService.delete(request.fileUrl());
         documentRepository.markCompleted(documentId, Instant.now());
 
-        log.info("Ingest complete: session={} document={} windows={} anomalous={} metricRows={}",
-            sessionId, documentId, windows.size(), anomalousWindows, metricRows.size());
+        // Nothing to enrich (no anomalies and embeddings disabled) → no work items
+        // will ever drive the counter, so advance the session to CORRELATING here.
+        if (workItems == 0) {
+            enrichCompletion.checkAndTrigger(sessionId);
+        }
+
+        log.info("Ingest complete: session={} document={} windows={} anomalous={} workItems={} metricRows={}",
+            sessionId, documentId, windows.size(), anomalousWindows, workItems, metricRows.size());
     }
 
     private List<String> readAllLines(String fileUrl) {
