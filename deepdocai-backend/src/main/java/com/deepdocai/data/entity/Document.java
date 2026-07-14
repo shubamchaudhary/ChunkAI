@@ -4,13 +4,20 @@ import com.deepdocai.common.constants.ProcessingStatus;
 import jakarta.persistence.*;
 import lombok.*;
 import org.hibernate.annotations.CreationTimestamp;
-import org.hibernate.annotations.UpdateTimestamp;
 
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.UUID;
 
+/**
+ * One uploaded log archive. The raw bytes live in MinIO staging
+ * ({@code fileUrl = s3://staging/{sessionId}/{documentId}}) and are removed
+ * after successful processing ({@code stagedFileDeleted}).
+ *
+ * <p>The id is assigned by the caller before staging so the MinIO object key
+ * and {@code fileUrl} can be built up-front; hence no {@code @GeneratedValue}.
+ * The {@code (session_id, original_file_name, file_size_bytes)} unique
+ * constraint makes re-uploads idempotent.
+ */
 @Entity
 @Table(name = "documents")
 @Getter
@@ -19,65 +26,41 @@ import java.util.UUID;
 @AllArgsConstructor
 @Builder
 public class Document {
-    
+
     @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
-    
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "user_id", nullable = false)
-    private User user;
-    
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "chat_id", nullable = false)
-    private Chat chat;
-    
-    @Column(name = "file_name", nullable = false)
-    private String fileName;
-    
-    @Column(name = "original_file_name", nullable = false)
+
+    @Column(name = "user_id", nullable = false)
+    private UUID userId;
+
+    @Column(name = "session_id", nullable = false)
+    private UUID sessionId;
+
+    @Column(name = "original_file_name", nullable = false, length = 500)
     private String originalFileName;
-    
-    @Column(name = "file_type", nullable = false)
-    private String fileType;
-    
+
+    @Column(name = "file_url", nullable = false)
+    private String fileUrl;
+
     @Column(name = "file_size_bytes", nullable = false)
     private Long fileSizeBytes;
-    
-    @Column(name = "mime_type")
-    private String mimeType;
-    
-    @Column(name = "total_pages")
-    private Integer totalPages;
-    
-    @Column(name = "total_chunks")
-    @Builder.Default
-    private Integer totalChunks = 0;
-    
+
     @Enumerated(EnumType.STRING)
-    @Column(name = "processing_status")
+    @Column(name = "processing_status", nullable = false, length = 20)
     @Builder.Default
     private ProcessingStatus processingStatus = ProcessingStatus.PENDING;
-    
-    @Column(name = "processing_started_at")
-    private Instant processingStartedAt;
-    
-    @Column(name = "processing_completed_at")
-    private Instant processingCompletedAt;
-    
-    @Column(name = "error_message", columnDefinition = "TEXT")
-    private String errorMessage;
-    
-    @CreationTimestamp
-    @Column(name = "created_at")
-    private Instant createdAt;
-    
-    @UpdateTimestamp
-    @Column(name = "updated_at")
-    private Instant updatedAt;
-    
-    @OneToMany(mappedBy = "document", cascade = CascadeType.ALL, orphanRemoval = true)
-    @Builder.Default
-    private List<DocumentChunk> chunks = new ArrayList<>();
-}
 
+    @Column(name = "staged_file_deleted")
+    @Builder.Default
+    private Boolean stagedFileDeleted = false;
+
+    @Column(name = "error_message")
+    private String errorMessage;
+
+    @CreationTimestamp
+    @Column(name = "uploaded_at", updatable = false)
+    private Instant uploadedAt;
+
+    @Column(name = "processed_at")
+    private Instant processedAt;
+}
