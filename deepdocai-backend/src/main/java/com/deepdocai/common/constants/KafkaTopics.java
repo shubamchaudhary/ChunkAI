@@ -13,4 +13,7 @@ public final class KafkaTopics {
 
     /** Upload accepted → request ingest/chunking. Key = sessionId. */
     public static final String LOG_INGEST_REQUESTS = "log.ingest.requests";
+
+    /** Dead letters from the ingest lane (poison ingest requests). */
+    public static final String LOG_INGEST_DLQ = "log.ingest.dlq";
 }
