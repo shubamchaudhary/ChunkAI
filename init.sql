@@ -1,16 +1,16 @@
 -- ============================================
--- DEEPDOCAI DATABASE SCHEMA
+-- LOGLENS DATABASE SCHEMA
 -- Run this in Railway PostgreSQL or local Docker
 -- ============================================
 
--- Ensure the deepdocai user exists and password is set correctly
+-- Ensure the loglens user exists and password is set correctly
 -- This handles cases where POSTGRES_USER creates the user but password auth fails
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT FROM pg_user WHERE usename = 'deepdocai') THEN
-        CREATE USER deepdocai WITH PASSWORD 'deepdocai123' SUPERUSER;
+    IF NOT EXISTS (SELECT FROM pg_user WHERE usename = 'loglens') THEN
+        CREATE USER loglens WITH PASSWORD 'loglens123' SUPERUSER;
 ELSE
-        ALTER USER deepdocai WITH PASSWORD 'deepdocai123';
+        ALTER USER loglens WITH PASSWORD 'loglens123';
 END IF;
 END
 $$;

@@ -5,7 +5,7 @@ plugins {
 }
 
 allprojects {
-    group = "com.scalelogs"
+    group = "com.loglens"
     version = "1.0.0-SNAPSHOT"
 
     repositories {

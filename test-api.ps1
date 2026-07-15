@@ -1,4 +1,4 @@
-# ExamPrep AI - Quick API Test Script
+# LogLens AI - Quick API Test Script
 # Usage: .\test-api.ps1
 
 param(
@@ -6,7 +6,7 @@ param(
     [string]$BaseUrl = "http://localhost:8080"
 )
 
-Write-Host "=== ExamPrep AI API Test ===" -ForegroundColor Cyan
+Write-Host "=== LogLens AI API Test ===" -ForegroundColor Cyan
 Write-Host ""
 
 # Check if API is running
@@ -14,7 +14,7 @@ Write-Host "Checking if API is running..." -ForegroundColor Yellow
 try {
     $healthCheck = Invoke-WebRequest -Uri "$BaseUrl/api/v1/auth/register" -Method POST -ErrorAction SilentlyContinue
 } catch {
-    Write-Host "❌ API is not running! Please start it with: .\gradlew :examprep-api:bootRun" -ForegroundColor Red
+    Write-Host "❌ API is not running! Please start it with: .\gradlew :loglens-api:bootRun" -ForegroundColor Red
     exit 1
 }
 

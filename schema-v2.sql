@@ -1,5 +1,5 @@
 -- ============================================================
--- ScaleLogs v2 — Log Intelligence Pipeline schema
+-- LogLens v2 — Log Intelligence Pipeline schema
 -- Target design: docs/02-target-architecture.md §6
 -- Apply to a FRESH database (prototype: data loss from v1 acceptable).
 -- Replaces init.sql for v2. Per-session chunk tables are created at

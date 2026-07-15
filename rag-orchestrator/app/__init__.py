@@ -1,5 +1,5 @@
 """
-ScaleLogs RAG orchestrator — the Python LangGraph sidecar (Layer 3).
+LogLens RAG orchestrator — the Python LangGraph sidecar (Layer 3).
 
 Two graphs run here, both reading and writing Postgres directly (the Java side
 owns nothing in this layer):

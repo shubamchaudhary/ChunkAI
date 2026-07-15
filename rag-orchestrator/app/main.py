@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("orchestrator")
 
-app = FastAPI(title="ScaleLogs RAG Orchestrator", version="1.0.0")
+app = FastAPI(title="LogLens RAG Orchestrator", version="1.0.0")
 
 
 class DrilldownRequest(BaseModel):

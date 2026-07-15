@@ -1,16 +1,16 @@
 .git
 .gitignore
 README.md
-examprep-frontend
+loglens-frontend
 node_modules
 .idea
 .vscode
 *.iml
 .gradle
 build
-examprep-api/build
-examprep-core/build
-examprep-data/build
-examprep-llm/build
+loglens-api/build
+loglens-core/build
+loglens-data/build
+loglens-llm/build
 uploads
 

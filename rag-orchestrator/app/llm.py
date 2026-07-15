@@ -1,7 +1,7 @@
 """Thin provider-agnostic wrappers over the chat + embedding models.
 
 Provider is selected by LLM_PROVIDER (see config.py) and MUST match the Java
-lane's scalelogs.llm.provider — especially for embeddings, where the drill-down
+lane's loglens.llm.provider — especially for embeddings, where the drill-down
 question must be embedded by the same model that embedded the chunks at ingest.
 
 Clients are created lazily so the service still imports and serves `/health`

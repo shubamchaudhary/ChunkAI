@@ -1,4 +1,4 @@
-# ScaleLogs (ScaleLogs) — Current Architecture, In Depth
+# LogLens (LogLens) — Current Architecture, In Depth
 
 > Audience: you (interview prep) and any agent/dev taking over this codebase.
 > Everything in this document is verified against the code as of 2026-07-14. File paths are given so you can re-verify.
@@ -13,20 +13,20 @@ A RAG (Retrieval-Augmented Generation) document Q&A application. Users upload do
 
 | Layer | Technology | Where |
 |---|---|---|
-| API | Spring Boot 3.2.5, Java 17, single Gradle module | `scalelogs-backend` |
+| API | Spring Boot 3.2.5, Java 17, single Gradle module | `loglens-backend` |
 | Auth | Spring Security + JWT (stateless) | `api/security/*` |
 | DB | PostgreSQL 16 + pgvector (HNSW index) | `docker-compose.yml`, `init.sql` |
 | LLM | Google Gemini 2.5 Flash (generation), text-embedding-004 (768-dim embeddings) | `llm/client/GeminiClient.java` |
 | Extraction | PDFBox (PDF), Apache POI (PPT/PPTX), Tesseract OCR (images) | `core/processor/impl/*` |
 | File storage | Local disk `./uploads` | `core/service/impl/LocalFileStorageService.java` |
-| Frontend | React + Vite + Tailwind | `examprep-frontend` |
+| Frontend | React + Vite + Tailwind | `loglens-frontend` |
 | Job queue | PostgreSQL table `processing_jobs` + polling worker | `core/service/ProcessingJobWorker.java` |
 | LLM work queue | In-memory `LinkedBlockingQueue` + key-pinned worker threads | `llm/worker/KeyedWorkerPool.java` |
 
-**Package layout** (one Spring Boot module, layered by package — the old multi-module `examprep-*` split was collapsed):
+**Package layout** (one Spring Boot module, layered by package — the old multi-module `loglens-*` split was collapsed):
 
 ```
-com.scalelogs
+com.loglens
 ├── api        → controllers, DTOs, security (JWT), exception handler
 ├── common     → constants (FileTypes, ProcessingStatus), utils (FileUtils, TokenCounter)
 ├── core       → document processors, chunking, file storage, job worker, DocumentProcessingService
@@ -44,7 +44,7 @@ flowchart LR
         FE[React Frontend]
     end
 
-    subgraph SpringBoot["Spring Boot Monolith (scalelogs-backend)"]
+    subgraph SpringBoot["Spring Boot Monolith (loglens-backend)"]
         AUTH[JWT Auth Filter]
         DC[DocumentController]
         QC[QueryController]
@@ -165,11 +165,11 @@ sequenceDiagram
 
 ### Under the hood, step by step
 
-**1. Upload endpoint** ([DocumentController.java](../scalelogs-backend/src/main/java/com/scalelogs/api/controller/DocumentController.java)) — validates the file (extension + size via `FileUtils`), verifies the chat belongs to the JWT user (403 otherwise), checks duplicates by `(chatId, originalFileName, fileSizeBytes)` and short-circuits with the existing document. Creates the `documents` row first (to get the UUID), then writes the file to disk named by that UUID, then inserts a `processing_jobs` row. Returns immediately — **the HTTP request never waits for processing**.
+**1. Upload endpoint** ([DocumentController.java](../loglens-backend/src/main/java/com/loglens/api/controller/DocumentController.java)) — validates the file (extension + size via `FileUtils`), verifies the chat belongs to the JWT user (403 otherwise), checks duplicates by `(chatId, originalFileName, fileSizeBytes)` and short-circuits with the existing document. Creates the `documents` row first (to get the UUID), then writes the file to disk named by that UUID, then inserts a `processing_jobs` row. Returns immediately — **the HTTP request never waits for processing**.
 
-**2. Job pickup** ([ProcessingJobWorker.java](../scalelogs-backend/src/main/java/com/scalelogs/core/service/ProcessingJobWorker.java)) — `@Scheduled(fixedDelay = 3000)` polls for QUEUED jobs, takes up to 5, and runs each on a fixed thread pool. Each job is **locked** by writing `locked_by` + `locked_until = now + 5 min` in its own `REQUIRES_NEW` transaction, `saveAndFlush`ed so the lock is visible to other transactions immediately. Failure handling is deliberately paranoid: failure status is written in a *separate* `REQUIRES_NEW` transaction (so a rolled-back processing transaction can't roll back the failure record), with a last-resort fallback that resets the job to QUEUED so nothing is ever stuck in PROCESSING forever.
+**2. Job pickup** ([ProcessingJobWorker.java](../loglens-backend/src/main/java/com/loglens/core/service/ProcessingJobWorker.java)) — `@Scheduled(fixedDelay = 3000)` polls for QUEUED jobs, takes up to 5, and runs each on a fixed thread pool. Each job is **locked** by writing `locked_by` + `locked_until = now + 5 min` in its own `REQUIRES_NEW` transaction, `saveAndFlush`ed so the lock is visible to other transactions immediately. Failure handling is deliberately paranoid: failure status is written in a *separate* `REQUIRES_NEW` transaction (so a rolled-back processing transaction can't roll back the failure record), with a last-resort fallback that resets the job to QUEUED so nothing is ever stuck in PROCESSING forever.
 
-**3. Transaction discipline** ([DocumentProcessingService.java](../scalelogs-backend/src/main/java/com/scalelogs/core/service/DocumentProcessingService.java)) — this is an interview gold nugget. Processing a document can take **minutes** (rate-limited LLM calls). Holding a DB transaction (and its connection) open that long exhausts the Hikari pool. So the flow is split into three boundaries:
+**3. Transaction discipline** ([DocumentProcessingService.java](../loglens-backend/src/main/java/com/loglens/core/service/DocumentProcessingService.java)) — this is an interview gold nugget. Processing a document can take **minutes** (rate-limited LLM calls). Holding a DB transaction (and its connection) open that long exhausts the Hikari pool. So the flow is split into three boundaries:
    - **TX1 (short):** set status=PROCESSING, delete any old chunks (reprocessing safety).
    - **No TX (long):** extraction + chunking + embedding — pure computation and HTTP calls, zero DB connections held.
    - **TX2 (short):** batch-insert all chunks + set status=COMPLETED atomically.
@@ -181,7 +181,7 @@ sequenceDiagram
 
 **6. Embedding** — see §6 below (the worker pool is shared machinery).
 
-**7. Persistence** — `batchSaveChunksWithEmbeddings` (custom repo, [DocumentChunkRepositoryImpl](../scalelogs-backend/src/main/java/com/scalelogs/data/repository/DocumentChunkRepositoryImpl.java)) does a native batched INSERT with vectors serialized to pgvector's `[x,y,...]` literal format. Chunks whose embedding batch failed are **skipped, not blocked on** — partial success beats total failure for a study tool.
+**7. Persistence** — `batchSaveChunksWithEmbeddings` (custom repo, [DocumentChunkRepositoryImpl](../loglens-backend/src/main/java/com/loglens/data/repository/DocumentChunkRepositoryImpl.java)) does a native batched INSERT with vectors serialized to pgvector's `[x,y,...]` literal format. Chunks whose embedding batch failed are **skipped, not blocked on** — partial success beats total failure for a study tool.
 
 ---
 
@@ -220,9 +220,9 @@ sequenceDiagram
 
 ### Under the hood
 
-**Stage 1 — Retrieval** ([RagService.java](../scalelogs-backend/src/main/java/com/scalelogs/llm/service/RagService.java)): the question is embedded (single direct Gemini call using key slot 0, bypassing the queue for latency), then a pgvector cosine search runs, scoped to `user_id` (+ `chat_id` unless `useCrossChat`), optionally restricted to specific `documentIds`, returning up to **500** chunks (`scalelogs.rag.max-retrieved-chunks`). 500 is deliberately huge — the philosophy is "recall first, let compression sort it out" rather than betting everything on top-10 precision.
+**Stage 1 — Retrieval** ([RagService.java](../loglens-backend/src/main/java/com/loglens/llm/service/RagService.java)): the question is embedded (single direct Gemini call using key slot 0, bypassing the queue for latency), then a pgvector cosine search runs, scoped to `user_id` (+ `chat_id` unless `useCrossChat`), optionally restricted to specific `documentIds`, returning up to **500** chunks (`loglens.rag.max-retrieved-chunks`). 500 is deliberately huge — the philosophy is "recall first, let compression sort it out" rather than betting everything on top-10 precision.
 
-**Stage 2 — Recursive hierarchical summarization** ([RecursiveSummarizationService.java](../scalelogs-backend/src/main/java/com/scalelogs/llm/rag/RecursiveSummarizationService.java)) — the most interesting algorithm in the codebase:
+**Stage 2 — Recursive hierarchical summarization** ([RecursiveSummarizationService.java](../loglens-backend/src/main/java/com/loglens/llm/rag/RecursiveSummarizationService.java)) — the most interesting algorithm in the codebase:
 
 1. **Token math**: tokens ≈ `chars / 3.5`. Usable window = `1,000,000 (Gemini context) × 0.80 (utilization) × 0.85 (safety) ≈ 680k tokens`, minus system prompt, question, and an 8,192-token output reservation.
 2. **Base case**: if all blocks fit → join with separators and return (no LLM calls at all for small doc sets).
@@ -241,7 +241,7 @@ Worked example: 500 chunks ≈ 400k tokens → level 0 splits into ~say 3 parts 
 
 ## 6. API key management & the KeyedWorkerPool (deep dive)
 
-Files: [ApiKeySlot.java](../scalelogs-backend/src/main/java/com/scalelogs/llm/key/ApiKeySlot.java), [ApiKeyManager.java](../scalelogs-backend/src/main/java/com/scalelogs/llm/key/ApiKeyManager.java), [KeyedWorkerPool.java](../scalelogs-backend/src/main/java/com/scalelogs/llm/worker/KeyedWorkerPool.java)
+Files: [ApiKeySlot.java](../loglens-backend/src/main/java/com/loglens/llm/key/ApiKeySlot.java), [ApiKeyManager.java](../loglens-backend/src/main/java/com/loglens/llm/key/ApiKeyManager.java), [KeyedWorkerPool.java](../loglens-backend/src/main/java/com/loglens/llm/worker/KeyedWorkerPool.java)
 
 **The problem:** Gemini free-tier keys allow ~10 requests/min *per key*. One key is far too slow for bulk ingestion (100 PPTs × dozens of chunks). Solution: N keys (currently 5) used concurrently, each kept safely under its limit.
 
@@ -272,15 +272,15 @@ Two consumers of this machinery:
 
 ---
 
-## 8. Configuration that matters ([application.properties](../scalelogs-backend/src/main/resources/application.properties))
+## 8. Configuration that matters ([application.properties](../loglens-backend/src/main/resources/application.properties))
 
 | Property | Value | Why |
 |---|---|---|
 | `gemini.api-keys` | 5 keys, comma-sep | one worker thread each |
-| `scalelogs.gemini.rate-limit-utilization` | 0.80 | 8 of 10 RPM → 7,500 ms/key |
-| `scalelogs.embedding.batch-size` | 80 | ≤100 API cap, margin |
-| `scalelogs.rag.max-retrieved-chunks` | 500 | recall-first retrieval |
-| `scalelogs.gemini.context-limit-tokens` | 1,000,000 | Gemini 2.5 Flash window |
+| `loglens.gemini.rate-limit-utilization` | 0.80 | 8 of 10 RPM → 7,500 ms/key |
+| `loglens.embedding.batch-size` | 80 | ≤100 API cap, margin |
+| `loglens.rag.max-retrieved-chunks` | 500 | recall-first retrieval |
+| `loglens.gemini.context-limit-tokens` | 1,000,000 | Gemini 2.5 Flash window |
 | `hikari.maximum-pool-size` | 30 | 5 embed + 5 summarize workers + HTTP + jobs |
 | `hikari.leak-detection-threshold` | 120,000 | catch tx-held-during-API-call bugs |
 | multipart max sizes | 1GB/2GB | bulk uploads |

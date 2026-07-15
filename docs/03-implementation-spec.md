@@ -1,4 +1,4 @@
-# ScaleLogs v2 — Implementation Spec (code-level, agent-executable)
+# LogLens v2 — Implementation Spec (code-level, agent-executable)
 
 > **How to use this file:** each phase below is a self-contained coding task sized for one PR. Execute phases **in order** — each leaves the app buildable and runnable. Hand a phase to a coding agent verbatim (`gh` + agent of choice); the phase text + this header + [02-target-architecture.md](02-target-architecture.md) is the full context needed. **Skip writing tests** (owner's call — a separate pass will add them). Update [HANDOVER.md](HANDOVER.md) after each phase lands.
 
@@ -7,20 +7,20 @@
 1. **v1 doc-QA mode is DELETED, not kept.** Owner decision: focus the product; git history preserves the old code. The deletion list per phase is part of the task.
 2. Schema: [/schema-v2.sql](../schema-v2.sql) applied to a **fresh database** (drop v1 tables; keep `users` shape — it's identical). `init.sql` is replaced by `schema-v2.sql` in docker-compose.
 3. `sessions` replaces `chats` everywhere: entity `Session`, repo `SessionRepository`, REST path `/api/v1/sessions`.
-4. All new backend code in existing module `scalelogs-backend`, package roots:
-   - `com.scalelogs.ingest` — chunker, parsers, anomaly detection
-   - `com.scalelogs.enrich` — Kafka LLM lanes, findings
-   - `com.scalelogs.analysis` — status, completion trigger, query APIs, SSE
-   - `com.scalelogs.storage` — MinIO staging + per-session chunk tables
+4. All new backend code in existing module `loglens-backend`, package roots:
+   - `com.loglens.ingest` — chunker, parsers, anomaly detection
+   - `com.loglens.enrich` — Kafka LLM lanes, findings
+   - `com.loglens.analysis` — status, completion trigger, query APIs, SSE
+   - `com.loglens.storage` — MinIO staging + per-session chunk tables
    - keep: `api` (auth/security), `data` (entities/repos), `llm` (GeminiClient), `common`
 5. **Keep and reuse:** `GeminiClient`, `ApiKeyManager` (key list + per-key pacing intervals), JWT security stack, `GlobalExceptionHandler`, WebClient config.
 6. Kafka client: `spring-kafka`. Topics auto-created via `KafkaAdmin` `NewTopic` beans. JSON payloads via Jackson (`JsonSerializer`/`JsonDeserializer`, type headers off, explicit target types).
 7. Consumers: **manual ack** (`AckMode.MANUAL`), commit after DB write → at-least-once. Every handler idempotent (natural keys in schema-v2 make this free).
-8. Timestamps in UTC everywhere; time windows default **60s** (`scalelogs.window-seconds=60`).
-9. Config prefix for all new keys: `scalelogs.*`. Keep existing `gemini.*` keys.
+8. Timestamps in UTC everywhere; time windows default **60s** (`loglens.window-seconds=60`).
+9. Config prefix for all new keys: `loglens.*`. Keep existing `gemini.*` keys.
 10. Errors: any unexpected consumer exception → log + nack with backoff (Spring `DefaultErrorHandler`, 3 attempts) → then produce raw record to the relevant `.dlq` topic and ack.
 
-## Message schemas (JSON, one class each in `com.scalelogs.common.messages`)
+## Message schemas (JSON, one class each in `com.loglens.common.messages`)
 
 ```java
 IngestRequest      { UUID sessionId; UUID userId; UUID documentId; String fileUrl; }
@@ -45,19 +45,19 @@ EnrichRequest      { UUID workId; UUID sessionId; String kind;      // ENRICH_WI
 - `kafka`: `apache/kafka:latest` single-node KRaft (`KAFKA_NODE_ID=1`, combined broker+controller, `PLAINTEXT://localhost:9092`, auto-create topics on).
 - `minio`: `minio/minio`, `server /data --console-address :9001`, ports 9000/9001, root user `minioadmin`/`minioadmin123`, named volume.
 
-**build.gradle.kts** (scalelogs-backend): add `org.springframework.kafka:spring-kafka`, `io.minio:minio:8.5.x`.
+**build.gradle.kts** (loglens-backend): add `org.springframework.kafka:spring-kafka`, `io.minio:minio:8.5.x`.
 
 **application.properties** additions:
 ```properties
 spring.kafka.bootstrap-servers=localhost:9092
-scalelogs.window-seconds=60
-scalelogs.embedding.enabled=true
-scalelogs.embedding.batch-size=80
-scalelogs.minio.endpoint=http://localhost:9000
-scalelogs.minio.access-key=minioadmin
-scalelogs.minio.secret-key=minioadmin123
-scalelogs.minio.bucket=staging
-scalelogs.orchestrator.url=http://localhost:8000
+loglens.window-seconds=60
+loglens.embedding.enabled=true
+loglens.embedding.batch-size=80
+loglens.minio.endpoint=http://localhost:9000
+loglens.minio.access-key=minioadmin
+loglens.minio.secret-key=minioadmin123
+loglens.minio.bucket=staging
+loglens.orchestrator.url=http://localhost:8000
 ```
 
 **Definition of done:** `docker compose up -d` starts postgres+kafka+minio healthy; app boots against fresh schema-v2 DB.
@@ -80,7 +80,7 @@ scalelogs.orchestrator.url=http://localhost:8000
 
 **New in `ingest/`:**
 - `IngestConsumer` — `@KafkaListener(topics=log.ingest.requests, groupId=ingest-workers)`. Flow: set session `CHUNKING` → stream file from MinIO **line by line** (never whole file) → `TimeWindowChunker` → batch-insert chunks (JDBC batch, 500/insert) into the session's table → set `PARSING` → run parsers per window → upsert `log_metrics` → mark anomalous windows (`is_anomalous=true`) → set `total_windows` → produce `EnrichRequest`s (see Phase 3 producer) → set `ENRICHING` → delete staged file + `staged_file_deleted=true`, `processed_at=now()`.
-- `TimeWindowChunker` — groups lines into windows by parsed timestamp (`scalelogs.window-seconds`). Timestamp extraction: try configurable regex list (ISO-8601, `yyyy-MM-dd HH:mm:ss`, syslog). Lines without timestamps join the current window. **No timestamps at all → fallback: 500-line windows, synthetic buckets from file order.**
+- `TimeWindowChunker` — groups lines into windows by parsed timestamp (`loglens.window-seconds`). Timestamp extraction: try configurable regex list (ISO-8601, `yyyy-MM-dd HH:mm:ss`, syslog). Lines without timestamps join the current window. **No timestamps at all → fallback: 500-line windows, synthetic buckets from file order.**
 - `parser/LogWindowParser` interface: `List<MetricRow> parse(Window w)` + `boolean isAnomalous(Window w)` contribution.
 - Implementations (regex-based, one class each): `ApiCallParser` (endpoint counts + latency ms extraction), `SqlParser` (query counts, failures/timeouts/deadlocks), `ErrorParser` (exception names, stack-trace fingerprint = SHA-256 of exception class + top 3 frames), `LifecycleParser` (restart/deploy/config markers), `PerformanceParser` (GC pause, thread pool, OOM warnings), `AuthParser` (401/403), `TrafficParser` (line/request volume per bucket).
 - `AnomalyDetector` — window is anomalous if: any ERROR/FATAL/exception line, WARN count ≥ 5, or any parser latency > p95 × 3 (computed after full pass; two-pass over windows is fine).
@@ -94,7 +94,7 @@ scalelogs.orchestrator.url=http://localhost:8000
 
 **New in `enrich/`:**
 - `KafkaTopicsConfig` — the `NewTopic` beans (partition count for `llm.enrich.requests` from `ApiKeyManager.getSlotCount()`).
-- `EnrichProducer` — sends `EnrichRequest`s: one `ENRICH_WINDOW` per anomalous window; `EMBED_BATCH` per 80 chunks (all windows) when `scalelogs.embedding.enabled`.
+- `EnrichProducer` — sends `EnrichRequest`s: one `ENRICH_WINDOW` per anomalous window; `EMBED_BATCH` per 80 chunks (all windows) when `loglens.embedding.enabled`.
 - `EnrichConsumer` — `@KafkaListener(topics=llm.enrich.requests, groupId=llm-workers, concurrency = <slot count>)`, `AckMode.MANUAL`. Per record: `apiKey = apiKeyManager.getApiKey(record.partition())`; enforce per-partition pacing (map partition → lastCallMs; sleep to honor 7500ms — reuse `ApiKeySlot` logic keyed by partition). Dispatch by kind:
   - `ENRICH_WINDOW`: load window content from chunk table → prompt (below) → `GeminiClient.generateContent` with **JSON response** → parse into finding(s) → upsert `log_findings` on `(session_id, fingerprint)` (`occurrence_count++`, merge evidence ids) → `incrementEnrichedWindows`.
   - `EMBED_BATCH`: `GeminiClient.batchGenerateEmbeddings` → `UPDATE log_chunks_s_{id} SET embedding=... WHERE chunk_id=...` (JDBC batch).

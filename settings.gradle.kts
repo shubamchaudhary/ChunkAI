@@ -1,3 +1,3 @@
-rootProject.name = "scalelogs"
+rootProject.name = "loglens"
 
-include("scalelogs-backend")
+include("loglens-backend")

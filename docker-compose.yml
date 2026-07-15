@@ -3,18 +3,18 @@ version: '3.8'
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: deepdocai-postgres
+    container_name: loglens-postgres
     environment:
-      POSTGRES_DB: deepdocai_db
-      POSTGRES_USER: deepdocai
-      POSTGRES_PASSWORD: deepdocai123
+      POSTGRES_DB: loglens_db
+      POSTGRES_USER: loglens
+      POSTGRES_PASSWORD: loglens123
     ports:
       - "5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./schema-v2.sql:/docker-entrypoint-initdb.d/schema-v2.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U deepdocai"]
+      test: ["CMD-SHELL", "pg_isready -U loglens"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -23,7 +23,7 @@ services:
   # Durable buffer for the LLM enrichment lanes (partition-per-API-key).
   kafka:
     image: apache/kafka:latest
-    container_name: scalelogs-kafka
+    container_name: loglens-kafka
     ports:
       - "9092:9092"
     environment:
@@ -53,7 +53,7 @@ services:
   # Uploads land here; the chunker streams them, then they are deleted.
   minio:
     image: minio/minio
-    container_name: scalelogs-minio
+    container_name: loglens-minio
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"   # S3 API
@@ -74,11 +74,11 @@ services:
   # writes the report, and answers drill-down questions over the chunk store.
   rag-orchestrator:
     build: ./rag-orchestrator
-    container_name: scalelogs-orchestrator
+    container_name: loglens-orchestrator
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://deepdocai:deepdocai123@postgres:5432/deepdocai_db
+      DATABASE_URL: postgresql://loglens:loglens123@postgres:5432/loglens_db
       LLM_PROVIDER: ${LLM_PROVIDER:-groq}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-gemini}
       # Plural *_API_KEYS are round-robined across all N keys (daily quota = sum
