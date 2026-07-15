@@ -4,7 +4,7 @@
 services:
   # Backend API Service
   - type: web
-    name: examprep-api
+    name: loglens-api
     runtime: docker
     dockerfilePath: ./Dockerfile
     plan: free
@@ -21,7 +21,35 @@ services:
         sync: false
       - key: SPRING_DATASOURCE_PASSWORD
         sync: false
+      - key: LLM_PROVIDER
+        value: groq
+      - key: EMBEDDING_PROVIDER
+        value: gemini
+      - key: GROQ_API_KEYS
+        sync: false
       - key: GEMINI_API_KEYS
+        sync: false
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        sync: false
+      - key: KAFKA_SECURITY_PROTOCOL
+        value: SASL_SSL
+      - key: KAFKA_SASL_MECHANISM
+        value: SCRAM-SHA-256
+      - key: KAFKA_SASL_USERNAME
+        sync: false
+      - key: KAFKA_SASL_PASSWORD
+        sync: false
+      - key: MINIO_ENDPOINT
+        sync: false
+      - key: MINIO_ACCESS_KEY
+        sync: false
+      - key: MINIO_SECRET_KEY
+        sync: false
+      - key: MINIO_BUCKET
+        value: staging
+      - key: ORCHESTRATOR_URL
+        sync: false
+      - key: GUEST_SESSION_ID
         sync: false
       - key: JWT_SECRET
         generateValue: true
@@ -30,15 +58,15 @@ services:
       - key: KEEPALIVE_ENABLED
         value: "true"
       - key: KEEPALIVE_URL
-        value: "https://chunkai.onrender.com/api/v1/health/ping"
+        value: "https://loglens.onrender.com/api/v1/health/ping"
       - key: KEEPALIVE_INTERVAL_MS
         value: "840000"
 
 databases:
-  - name: examprep-db
+  - name: loglens-db
     plan: free
-    databaseName: examprep_db
-    user: examprep
+    databaseName: loglens_db
+    user: loglens
     region: oregon
     postgresMajorVersion: "16"
     ipAllowList: []

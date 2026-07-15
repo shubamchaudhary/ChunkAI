@@ -1,3 +1,3 @@
-rootProject.name = "deepdocai"
+rootProject.name = "loglens"
 
-include("deepdocai-backend")
+include("loglens-backend")

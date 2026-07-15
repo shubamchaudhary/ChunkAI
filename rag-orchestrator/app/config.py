@@ -36,15 +36,15 @@ def _keys(plural: str, singular: str) -> list[str]:
 # dev it defaults to the host-published port (5434, NOT 5432).
 DATABASE_URL: str = os.environ.get(
     "DATABASE_URL",
-    "postgresql://deepdocai:deepdocai123@localhost:5434/deepdocai_db",
+    "postgresql://loglens:loglens123@localhost:5434/loglens_db",
 )
 
 # ── Provider switches ────────────────────────────────────────────────────────
 # Chat: "groq" (default) or "gemini". MUST match the Java side's
-# chunkai.llm.provider.
+# loglens.llm.provider.
 # Embeddings are SPLIT from chat: Groq serves no embedding models (2026-07), so
 # EMBEDDING_PROVIDER defaults to gemini. It MUST match the Java side's
-# chunkai.llm.embedding-provider — the drill-down question embedding has to use
+# loglens.llm.embedding-provider — the drill-down question embedding has to use
 # the same model that embedded the chunks at ingest, or cosine is meaningless.
 LLM_PROVIDER: str = os.environ.get("LLM_PROVIDER", "groq").strip().lower()
 EMBEDDING_PROVIDER: str = os.environ.get("EMBEDDING_PROVIDER", "gemini").strip().lower()

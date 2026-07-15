@@ -3,7 +3,7 @@ FROM gradle:8.5-jdk17 AS build
 WORKDIR /app
 COPY . .
 RUN chmod +x ./gradlew
-RUN ./gradlew :examprep-api:build -x test
+RUN ./gradlew :loglens-backend:build -x test
 
 # Runtime stage
 FROM eclipse-temurin:17-jdk-alpine
@@ -21,7 +21,7 @@ RUN apk update && \
 
 RUN addgroup -S spring && adduser -S spring -G spring
 USER spring:spring
-COPY --from=build /app/examprep-api/build/libs/examprep-api-1.0.0-SNAPSHOT.jar app.jar
+COPY --from=build /app/loglens-backend/build/libs/loglens-backend-1.0.0-SNAPSHOT.jar app.jar
 EXPOSE 8080
 # JVM optimizations for Render.com free tier (512MB RAM limit)
 # Aggressive memory reduction settings:

@@ -45,7 +45,7 @@ application-local.properties
 # Node
 node_modules/
 dist/
-.examprep-frontend/
+.loglens-frontend/
 
 # Database
 *.db
