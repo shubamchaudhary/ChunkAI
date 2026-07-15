@@ -62,7 +62,7 @@ public class GeminiClient {
         // times before giving up to the Kafka retry lane — a 429 must not fail
         // the batch. Daily-quota 429s (no retryDelay) are tracked per key so we
         // fail fast once EVERY key is daily-exhausted instead of burning ~45s.
-        int maxAttempts = Math.max(config.getMaxRetries(), keyCount * 3);
+        int maxAttempts = Math.max(config.getMaxRetries(), keyCount * 5);
         String keyToUse = resolveEmbeddingKey(apiKey);
         Exception lastException = null;
         boolean lastWasRateLimit = false;
@@ -102,11 +102,15 @@ public class GeminiClient {
                         continue;
                     }
                     String next = resolveEmbeddingKey(apiKey);   // advance to another key
-                    log.warn("batchEmbedContents 429 (attempt {}/{}), waiting {}ms then retrying on {} key",
-                        attempt + 1, maxAttempts, config.getRateLimitRetryDelayMs(),
-                        next.equals(keyToUse) ? "same" : "another");
+                    boolean sameKey = next.equals(keyToUse);
+                    log.warn("batchEmbedContents 429 (attempt {}/{}), {} key{}",
+                        attempt + 1, maxAttempts,
+                        sameKey ? "same" : "rotating to another",
+                        sameKey ? " — waiting " + config.getRateLimitRetryDelayMs() + "ms" : "");
                     keyToUse = next;
-                    sleepQuietly(config.getRateLimitRetryDelayMs());
+                    if (sameKey) {
+                        sleepQuietly(config.getRateLimitRetryDelayMs());
+                    }
                     continue;
                 }
                 if (status == 403) {
@@ -150,7 +154,7 @@ public class GeminiClient {
 
     public float[] generateEmbedding(String text, String apiKey) {
         int keyCount = Math.max(1, embeddingKeys().size());
-        int maxAttempts = Math.max(config.getMaxRetries(), keyCount * 3);
+        int maxAttempts = Math.max(config.getMaxRetries(), keyCount * 5);
         String keyToUse = resolveEmbeddingKey(apiKey);
 
         Map<String, Object> request = Map.of(
@@ -194,11 +198,15 @@ public class GeminiClient {
                         continue;
                     }
                     String next = resolveEmbeddingKey(apiKey);
-                    log.warn("embedContent 429 (attempt {}/{}), waiting {}ms then retrying on {} key",
-                        attempt + 1, maxAttempts, config.getRateLimitRetryDelayMs(),
-                        next.equals(keyToUse) ? "same" : "another");
+                    boolean sameKey = next.equals(keyToUse);
+                    log.warn("embedContent 429 (attempt {}/{}), {} key{}",
+                        attempt + 1, maxAttempts,
+                        sameKey ? "same" : "rotating to another",
+                        sameKey ? " — waiting " + config.getRateLimitRetryDelayMs() + "ms" : "");
                     keyToUse = next;
-                    sleepQuietly(config.getRateLimitRetryDelayMs());
+                    if (sameKey) {
+                        sleepQuietly(config.getRateLimitRetryDelayMs());
+                    }
                     continue;
                 }
                 if (status == 403) {
