@@ -98,7 +98,7 @@ export default function Login() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
             </svg>
           </div>
-          <h1 className="text-3xl font-bold text-gray-900">ChunkAI</h1>
+          <h1 className="text-3xl font-bold text-gray-900">ScaleLogs</h1>
           <p className="text-gray-600 mt-2">Sign in to continue</p>
         </div>
 
@@ -212,7 +212,7 @@ export default function Login() {
               <div className="w-full border-t border-gray-300"></div>
             </div>
             <div className="relative flex justify-center text-sm">
-              <span className="px-2 bg-white text-gray-500">New to ChunkAI?</span>
+              <span className="px-2 bg-white text-gray-500">New to ScaleLogs?</span>
             </div>
           </div>
 

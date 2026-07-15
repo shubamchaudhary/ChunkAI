@@ -1,8 +1,8 @@
-# ChunkAI
+# ScaleLogs
 
 Log intelligence pipeline. Upload a production log archive; get back exact metrics, classified failures, correlated incidents with root-cause narratives, and a generated report — every claim cited back to the actual log lines.
 
-Built for the question class where standard RAG structurally fails: **whole-corpus analytical questions**. "What defect patterns appeared this week?" isn't answerable from top-10 retrieved chunks — the answer is spread across thousands. ChunkAI analyzes the entire archive once at ingest, materializes the findings, and answers questions instantly from them.
+Built for the question class where standard RAG structurally fails: **whole-corpus analytical questions**. "What defect patterns appeared this week?" isn't answerable from top-10 retrieved chunks — the answer is spread across thousands. ScaleLogs analyzes the entire archive once at ingest, materializes the findings, and answers questions instantly from them.
 
 ## Design positions
 
@@ -58,14 +58,14 @@ Java 17+, Node 18+, Docker, and a free Gemini API key ([aistudio.google.com](htt
 ```bash
 cp .env.example .env                        # add GEMINI_API_KEYS
 docker-compose up -d                        # postgres+pgvector (kafka/minio join as phases land)
-./gradlew :deepdocai-backend:bootRun        # api on :8080
+./gradlew :scalelogs-backend:bootRun        # api on :8080
 cd examprep-frontend && npm i && npm run dev
 ```
 
 ## Layout
 
 ```
-deepdocai-backend/    Spring Boot backend
+scalelogs-backend/    Spring Boot backend
 examprep-frontend/    React frontend
 docs/                 architecture, decisions, migration plan
 init.sql              database schema

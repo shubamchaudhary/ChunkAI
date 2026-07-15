@@ -31,7 +31,7 @@ export default function SessionSidebar({
   return (
     <div className="w-72 bg-gray-900 text-white flex flex-col flex-shrink-0 h-screen">
       <div className="p-4 border-b border-gray-800">
-        <h1 className="text-lg font-bold">ChunkAI</h1>
+        <h1 className="text-lg font-bold">ScaleLogs</h1>
         <p className="text-xs text-gray-400">Log intelligence</p>
         {isGuest && (
           <span className="inline-block mt-1 px-2 py-0.5 text-xs bg-emerald-600 rounded-full text-white">

@@ -1,4 +1,4 @@
-# ChunkAI — Target Architecture (FINAL, refined): Log Intelligence Pipeline
+# ScaleLogs — Target Architecture (FINAL, refined): Log Intelligence Pipeline
 
 > Read [01-current-architecture.md](01-current-architecture.md) for the system as it exists today. This is the **finalized and refined target design** (2026-07-14). Refinement pass removed everything the log-analytics pivot made unnecessary — see §4 for the cut list, which is itself interview material.
 
@@ -6,11 +6,11 @@
 
 ## 1. The thesis
 
-**ChunkAI answers whole-corpus analytical questions over production log archives — the question class where standard top-k RAG structurally fails.**
+**ScaleLogs answers whole-corpus analytical questions over production log archives — the question class where standard top-k RAG structurally fails.**
 
 Standard RAG serves *needle-in-haystack* questions: embed query → fetch top-10 chunks → generate. It cannot answer *whole-haystack* questions ("what defect patterns appeared this week?", "reconstruct this incident", "how many SQL failures, when?") because the answer is spread across thousands of chunks and no top-k selection holds it.
 
-ChunkAI's move: **shift LLM work from query-time to ingest-time.** Analyze the whole archive once — parsers for numbers, LLMs for meaning — materialize typed findings into tables, generate a report. User questions then hit tables via SQL: instant, exact, hallucination-proof by construction, with one grounded RAG drill-down as the escape hatch.
+ScaleLogs's move: **shift LLM work from query-time to ingest-time.** Analyze the whole archive once — parsers for numbers, LLMs for meaning — materialize typed findings into tables, generate a report. User questions then hit tables via SQL: instant, exact, hallucination-proof by construction, with one grounded RAG drill-down as the escape hatch.
 
 - A **session = one corpus** (an incident's archive, a service's daily logs): 10⁵–10⁶ chunks. A workspace, not a chat.
 - Related work: GraphRAG makes the same query-time→index-time move; RAPTOR pre-builds summary trees. Ours additionally materializes *typed, structured* findings, not prose.

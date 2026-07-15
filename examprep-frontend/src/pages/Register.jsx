@@ -118,7 +118,7 @@ export default function Register() {
             </svg>
           </div>
           <h1 className="text-3xl font-bold text-gray-900">Create Account</h1>
-          <p className="text-gray-600 mt-2">Join ChunkAI and start learning smarter</p>
+          <p className="text-gray-600 mt-2">Join ScaleLogs and start learning smarter</p>
         </div>
 
         {/* Card */}

@@ -5,7 +5,7 @@ plugins {
 }
 
 allprojects {
-    group = "com.deepdocai"
+    group = "com.scalelogs"
     version = "1.0.0-SNAPSHOT"
 
     repositories {

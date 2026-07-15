@@ -23,7 +23,7 @@ services:
   # Durable buffer for the LLM enrichment lanes (partition-per-API-key).
   kafka:
     image: apache/kafka:latest
-    container_name: chunkai-kafka
+    container_name: scalelogs-kafka
     ports:
       - "9092:9092"
     environment:
@@ -53,7 +53,7 @@ services:
   # Uploads land here; the chunker streams them, then they are deleted.
   minio:
     image: minio/minio
-    container_name: chunkai-minio
+    container_name: scalelogs-minio
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"   # S3 API
@@ -74,7 +74,7 @@ services:
   # writes the report, and answers drill-down questions over the chunk store.
   rag-orchestrator:
     build: ./rag-orchestrator
-    container_name: chunkai-orchestrator
+    container_name: scalelogs-orchestrator
     ports:
       - "8000:8000"
     environment:
