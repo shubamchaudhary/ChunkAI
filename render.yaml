@@ -21,7 +21,27 @@ services:
         sync: false
       - key: SPRING_DATASOURCE_PASSWORD
         sync: false
+      - key: LLM_PROVIDER
+        value: groq
+      - key: EMBEDDING_PROVIDER
+        value: gemini
+      - key: GROQ_API_KEYS
+        sync: false
       - key: GEMINI_API_KEYS
+        sync: false
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        sync: false
+      - key: MINIO_ENDPOINT
+        sync: false
+      - key: MINIO_ACCESS_KEY
+        sync: false
+      - key: MINIO_SECRET_KEY
+        sync: false
+      - key: MINIO_BUCKET
+        value: staging
+      - key: ORCHESTRATOR_URL
+        sync: false
+      - key: GUEST_SESSION_ID
         sync: false
       - key: JWT_SECRET
         generateValue: true
