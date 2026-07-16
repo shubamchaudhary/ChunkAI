@@ -1,484 +1,553 @@
-# Current Design — End-to-End Live Walkthrough
+# LogLens Design — End-to-End Walkthrough (study edition)
 
-> **Purpose:** one document that shows *exactly how the system works today* (not the
-> aspirational target) — every hop, every table, every index — traced through one
-> concrete example, from **login → create session → upload a log file → processing →
-> asking a question**. Use this to reason about what to change next.
+> **Purpose:** read this once, slowly, and you can explain the whole system in an
+> interview — every hop, every table, every decision, and *why the obvious
+> alternative was rejected*. Jargon is explained the first time it appears in
+> **📖 plain words** boxes, and there's a one-line glossary at the end for review.
 >
-> Everything here is taken from the actual code:
-> `DocumentController`, `IngestConsumer`, `TimeWindowChunker`, `AnomalyDetector`,
-> `EnrichProducer`/`EnrichConsumer`, `SessionChunkTableManager`,
-> `SessionChunkRepository`, `schema-v2.sql`, and the Python `rag-orchestrator`
-> (`graph_analyze.py`, `graph_drilldown.py`, `db.py`).
+> **Status note (be honest in interviews):** everything here is live EXCEPT §5–§8's
+> partitioned ingest, which is the newest design ([docs/04](04-partitioned-ingest-spec.md),
+> implementation in progress). Say "I found the memory ceiling and redesigned ingest
+> around split manifests" — never claim it's deployed until it is.
 
 ---
 
-## 0. The cast (physical components)
+## 0. The cast (who runs where, and why that piece exists)
 
-| Component | Tech | Where it runs | Role |
+| Component | Tech | Runs on | One-line job |
 |---|---|---|---|
-| **Frontend** | React | Vercel (`deeploglens.vercel.app`) | Upload UI, progress (SSE), chat |
-| **Backend** | Java 21 / Spring Boot | Render (`loglens-api-…`) | Auth, upload, ingest+enrich Kafka workers, query proxy |
-| **Orchestrator** | Python / FastAPI / LangGraph | Render (`loglens-orchestrator`) | Graph 1 (correlation+report), Graph 2 (drill-down RAG) |
-| **Kafka** | Redpanda Cloud | managed | Async work queue (2 lanes) |
-| **Blob storage** | Backblaze B2 (S3 API, via MinIO client) | managed | Staging for the raw uploaded file |
-| **Database** | PostgreSQL 16 + `pgvector` | Render (`loglens-db`) | All state + per-session vector tables |
+| **Frontend** | React | Vercel | upload UI, live progress, report, chat |
+| **Backend** | Java / Spring Boot | Render | auth, upload, ALL the Kafka workers, query APIs |
+| **Orchestrator** | Python / FastAPI / LangGraph | Render | the two AI "brains": report writing + Q&A |
+| **Kafka** | Redpanda Cloud | managed | the conveyor belts between steps |
+| **Blob storage** | Backblaze B2 (S3 API) | managed | temporary parking for the raw uploaded file |
+| **PostgreSQL + pgvector** | Postgres 16 | Render | THE database — all truth lives here |
 
-**Two golden rules of the design (keep these in mind the whole way through):**
-1. **The request path never touches an LLM or a GB of data.** Upload returns `202`
-   in milliseconds; all heavy work is async behind Kafka.
-2. **Every chunk is stored and embedded; only *anomalous* windows get an LLM
-   narrative.** (This is the single most misunderstood part — see §5–§6.)
+> **📖 plain words — Kafka:** a durable message queue. Programs *produce* (add) small
+> messages onto named queues called **topics**; other programs *consume* (read) them.
+> Each topic is split into **partitions** (independent sub-queues) so several consumers
+> can work in parallel — Kafka guarantees each partition is read by exactly ONE consumer
+> in a group at a time. Kafka remembers how far each consumer got (the **offset**), so
+> after a crash you resume where you left off instead of starting over.
+>
+> **📖 plain words — blob storage:** a service for storing files ("objects") of any size,
+> accessed over HTTP. "S3 API" is the de-facto standard interface for it. The key
+> feature we exploit: a **ranged GET** — "give me only bytes 5,000,000–10,000,000 of
+> that file."
+>
+> **📖 plain words — pgvector:** a Postgres extension adding a `vector` column type and
+> similarity search over it — the same database that stores your rows can also answer
+> "find the most similar text."
+
+**The two golden rules of the whole design:**
+1. **The user-facing request path never does heavy work.** Upload returns in
+   milliseconds; everything expensive happens *behind* Kafka, asynchronously.
+2. **Kafka moves facts, blob moves bytes, Postgres holds truth.** Messages are tiny
+   pointers (~150 bytes); file content never travels through Kafka; every result
+   lands in Postgres.
 
 ---
 
-## 1. The example we'll trace
+## 1. The running example
 
 - **User:** `alice@corp.com`
 - **Session:** "payments-api — prod — 16 Jul"
-- **File:** `payments-api.log`, **2.4 MB, ~18,000 lines**, spanning **10:00 → 10:30** (30 min)
-- At **10:05** there's a burst of `SQLException` + slow requests (a real incident).
-- Later Alice asks: **"why did checkout fail around 10:05?"**
+- **File:** `payments-api.log` — **120 MB, ~900,000 lines**, covering **10:00 → 10:30**
+- At **10:05** there's a real incident: a burst of `SQLException` deadlocks + slow requests.
+- Afterwards Alice asks: *"why did checkout fail around 10:05?"*
 
-Assumptions the code uses: **60-second analysis windows**, embedding **batch size 10**
-(the configured `loglens.embedding.batch-size`), **5 Gemini API keys** → 5 partitions on
-the enrich lane.
-30 minutes of logs → **~30 windows** (one per minute).
+Two numbers to keep separate in your head (people mix these up):
+
+- **Windows = 30.** A window is **60 seconds of log time** — the unit of *analysis*.
+  30 minutes → ~30 windows, regardless of file size.
+- **Parts = 24.** A part is **~5 MB of file bytes** — the unit of *I/O and parallelism*.
+  120 MB → ~24 parts, regardless of time span.
+
+Parts exist so we never hold much in memory; windows exist so analysis follows the
+timeline. One part contains many complete windows.
 
 ---
 
-## 2. Login  →  `users` table
+## 2. Login → `users`
 
 ```mermaid
 sequenceDiagram
-    participant FE as React (Vercel)
-    participant BE as Spring Boot (Render)
+    participant FE as React
+    participant BE as Spring Boot
     participant DB as Postgres
-    FE->>BE: POST /api/v1/auth/login {email, password}
+    FE->>BE: POST /auth/login {email, password}
     BE->>DB: SELECT * FROM users WHERE email=?
-    BE->>BE: bcrypt.verify(password, password_hash)
-    BE-->>FE: 200 { JWT }  (updates last_login_at)
+    BE->>BE: bcrypt.verify(password, stored hash)
+    BE-->>FE: 200 { JWT }
 ```
 
-**`users`** (global table — one row per person):
+- Passwords are stored as **bcrypt hashes**, never plaintext.
+- The response is a **JWT** the frontend attaches to every later request
+  (`Authorization: Bearer …`).
 
-| id (UUID, PK) | email (UNIQUE) | password_hash | full_name | last_login_at | is_active |
-|---|---|---|---|---|---|
-| `u-alice` | alice@corp.com | `$2a$…` | Alice R. | 2026-07-16 10:00 | true |
+> **📖 plain words — hash:** a one-way scramble. You can check "does this password
+> produce this scramble?" but never un-scramble it back. bcrypt is a deliberately
+> *slow* hash, so a stolen database can't be brute-forced quickly.
+>
+> **📖 plain words — JWT (JSON Web Token):** a signed note from the server saying
+> "this is user u-alice, valid until tomorrow." The server keeps no login state in
+> memory — it just verifies the signature on each request. That's **stateless** auth:
+> any backend instance can serve any request.
 
-Indexes: `idx_users_email` on `email`.
-The JWT (subject = `u-alice`) is sent as `Authorization: Bearer …` on every later call.
+**Decision:** *why JWT, not server-side sessions?* Stateless = no shared session
+store = horizontal scaling is free. Trade-off: you can't revoke one token early
+without extra machinery — acceptable at a 24h expiry.
 
 ---
 
-## 3. Create session  →  `sessions` row **+ a dedicated chunk table is provisioned**
+## 3. Create session → a row AND a dedicated table
 
-This is the first architecturally distinctive step. Creating a session does **two**
-things:
+Creating a session does two things — the second is the most distinctive decision
+in the whole design:
 
 ```mermaid
 sequenceDiagram
-    participant FE
-    participant BE
-    participant DB
-    FE->>BE: POST /api/v1/sessions {title}
-    BE->>DB: INSERT INTO sessions (...) RETURNING id  --> s-42
-    BE->>DB: CREATE TABLE log_chunks_s_<s-42> (...)  + 3 indexes
-    BE-->>FE: 201 { sessionId: s-42, status: CREATED }
+    FE->>BE: POST /sessions {title}
+    BE->>DB: INSERT INTO sessions ... → s-42
+    BE->>DB: CREATE TABLE log_chunks_s_<s-42> + 3 indexes
+    BE-->>FE: 201 {sessionId}
 ```
 
-**`sessions`** (global — one row per corpus/workspace):
+**`sessions`** row: `{id=s-42, user_id=u-alice, title, analysis_status=CREATED,
+total_windows=0, enriched_windows=0}`. `analysis_status` walks a fixed path —
+`CREATED → CHUNKING → PARSING → ENRICHING → CORRELATING → REPORTING → DONE` — and
+the progress bar simply displays it.
 
-| id | user_id (FK→users) | title | analysis_status | total_windows | enriched_windows |
-|---|---|---|---|---|---|
-| `s-42` | `u-alice` | payments-api — prod — 16 Jul | `CREATED` | 0 | 0 |
+**`log_chunks_s_<s-42>`** — a brand-new physical table just for this session:
 
-- `analysis_status` walks a fixed state machine (the SSE progress bar reads it):
-  `CREATED → CHUNKING → PARSING → ENRICHING → CORRELATING → REPORTING → DONE` (or `FAILED`).
-- `total_windows` / `enriched_windows` = an **idempotent completion counter** (explained in §6).
-- Index: `idx_sessions_user (user_id, updated_at DESC)` → fast "my sessions, newest first".
+| column | meaning |
+|---|---|
+| `chunk_id` (PK) | one row = one 60-second window of logs |
+| `document_id` | which uploaded file it came from |
+| `time_bucket` | which minute this window covers |
+| `line_start` / `line_end` | line range in the original file → used for citations |
+| `content` | the raw log lines |
+| `embedding vector(768)` | the window's "meaning coordinates" — NULL until §9 fills it |
+| `is_anomalous` | did the anomaly gate flag this window? |
 
-**The per-session chunk table** (`SessionChunkTableManager.createFor`) — table name is
-`log_chunks_s_` + the UUID with `-`→`_`, e.g. `log_chunks_s_s_42…`. Built **only** from a
-validated UUID (SQL-injection guard). Created **empty** with all three indexes up front:
+Three indexes created up front: **HNSW** on `embedding` (semantic search), **GIN**
+full-text on `content` (keyword search), B-tree on `time_bucket` (time filters).
 
-**`log_chunks_s_<s-42>`** (one physical table *per session*):
+> **📖 plain words — embedding:** a list of 768 numbers encoding what a text *means*.
+> Texts with similar meaning get nearby number-lists; closeness is measured with
+> **cosine similarity**. This is what lets "why did checkout fail?" find a window
+> full of `SQLException` lines even though no words match.
+>
+> **📖 plain words — HNSW index:** a multi-layer "neighbor web" over all vectors.
+> A search hops through the web toward your query (thousands of comparisons) instead
+> of comparing against every row (millions) — approximate, but fast.
+>
+> **📖 plain words — GIN full-text index:** the classic keyword index — "which rows
+> contain *deadlock*?" answered instantly, no scanning.
 
-| column | type | note |
-|---|---|---|
-| `chunk_id` | UUID PK | one row = one 60s window of logs |
-| `document_id` | UUID | which uploaded file it came from |
-| `time_bucket` | TIMESTAMPTZ | the minute this window covers |
-| `line_start` / `line_end` | INTEGER | line range in the original file (for citations) |
-| `content` | TEXT | the raw log lines of this window |
-| `embedding` | **vector(768)** | filled later; **NULL at insert** |
-| `is_anomalous` | BOOLEAN | set by the anomaly gate |
-| `created_at` | TIMESTAMPTZ | |
-
-Three indexes created immediately (empty now, populated as rows land):
-
-| index | type | serves |
-|---|---|---|
-| `idx_lc_<tid>_hnsw` | **HNSW** on `embedding vector_cosine_ops` (m=16, ef_construction=64) | semantic kNN search |
-| `idx_lc_<tid>_fts` | **GIN** on `to_tsvector('simple', content)` | keyword / full-text search |
-| `idx_lc_<tid>_time` | B-tree on `time_bucket` | time-range filters |
-
-> **Why a whole table per session?** So each corpus gets its **own right-sized HNSW
-> index**. A single shared index over 250 services' vectors would force every query to
-> do filtered-ANN (`WHERE session_id=…` *after* the vector scan), which wrecks recall
-> and latency. Isolation = each search only ever walks its own graph. (Trade-off: many
-> tables — the stated exit strategy is hash-partitioning if the table count grows.)
+**Decision:** *why a table PER SESSION instead of one big shared chunks table?*
+Vector search with a filter is a trap: a shared HNSW index searches the whole
+company's vectors first and *then* discards other sessions' results (**filtered
+ANN**) — recall and speed collapse as the table grows. A per-session table means
+every search walks a small web containing ONLY this corpus. Bonuses: physically
+zero cross-tenant reads, and deleting a session = `DROP TABLE` (instant). *Ceiling:*
+tens of thousands of tables strain Postgres housekeeping — stated exit is hash
+partitioning. Table names are built ONLY from validated UUIDs — that's the
+SQL-injection guard on the runtime `CREATE TABLE`.
 
 ---
 
-## 4. Upload the file  →  B2 blob  +  **one** Kafka reference message  →  `202`
-
-Critical: the raw 2.4 MB file is **NOT** sent through Kafka. It goes to **blob storage**;
-Kafka only carries a tiny pointer.
+## 4. Upload → blob + `documents` row + ONE tiny Kafka message
 
 ```mermaid
 sequenceDiagram
-    participant FE
-    participant BE as DocumentController
-    participant B2 as Backblaze B2
-    participant DB as Postgres
-    participant K as Kafka (log.ingest.requests)
-    FE->>BE: POST /sessions/s-42/documents (multipart file)
-    BE->>B2: PUT staging/s-42/d-7 (stream the 2.4 MB file)
+    FE->>BE: POST /sessions/s-42/documents (the 120 MB file)
+    BE->>B2: stream to staging/s-42/d-7 (never buffered whole)
     BE->>DB: INSERT INTO documents (status=PENDING)
-    BE->>K: send IngestRequest{session=s-42, doc=d-7, fileUrl=s3://staging/s-42/d-7} key=s-42
-    BE-->>FE: 202 Accepted  (returns immediately — no processing yet)
+    BE->>K: log.ingest.requests ← {s-42, d-7, fileUrl} (~150 bytes)
+    BE-->>FE: 202 Accepted (immediately!)
 ```
 
-**`documents`** (global — one row per uploaded archive):
+- `202 Accepted` = "got it, working on it." The browser never waits for processing.
+- **Upload idempotency:** a unique constraint on `(session, filename, size)` — re-uploading
+  the same file returns the existing row instead of processing twice.
+- The Kafka message is sent **after** the DB row commits, so a consumer can never
+  see a message for a row that doesn't exist.
 
-| id | session_id | original_file_name | file_url | file_size_bytes | processing_status | staged_file_deleted |
-|---|---|---|---|---|---|---|
-| `d-7` | `s-42` | payments-api.log | `s3://staging/s-42/d-7` | 2,411,008 | `PENDING` | false |
+> **📖 plain words — idempotent:** safe to do twice — doing it again produces the
+> same end state. The property that makes retries harmless.
 
-- Idempotency: `uq_doc_per_session (session_id, original_file_name, file_size_bytes)` —
-  re-uploading the same file returns the existing row instead of reprocessing.
-- The Kafka message is published **after** the DB row commits, so a consumer can never
-  see a message for a row that isn't there.
+**Decision 1:** *why blob storage, not Postgres or Kafka, for the file?* Databases
+and brokers are terrible file systems: Kafka's default message cap is ~1 MB and its
+disks are sized for streams of small records; Postgres bloats. Blob stores are built
+for exactly this — big objects, streamed writes, **ranged reads**. This is the
+**claim-check pattern**: park the heavy thing, pass a small claim ticket around.
 
-**Kafka message on `log.ingest.requests`** (key = `s-42`): a ~120-byte JSON pointer, not the logs.
+**Decision 2:** *why a Kafka message at all when the URL is already in the
+`documents` table?* The message is the **wake-up call, not the data**. Without it,
+workers discover work by *polling* — querying the table every few seconds — plus
+lock columns so two workers don't grab the same row, plus stale-lock cleanup. We
+know the cost precisely because **v1 did exactly that** (`ProcessingJobWorker`,
+3-second polls, lease columns) — ~250 lines deleted when Kafka arrived. The broker
+pushes work the instant it exists, hands it to exactly one consumer, and remembers
+position across crashes.
 
 ---
 
-## 5. Ingest worker  →  chunk → parse → detect → **store every chunk** → fan out
+## 5. The SPLITTER — virtual parts (the ingest redesign)
 
-The `IngestConsumer` (group `ingest-workers`) picks up the pointer, **streams the file
-back from B2**, and runs the whole Layer-1 pipeline. Status flips
-`CHUNKING → PARSING → ENRICHING` as it goes (SSE updates the progress bar live).
+**The problem it solves:** the first implementation read the whole file into memory
+(`readAllLines`) and processed it as ONE Kafka record. At 2.4 MB fine; at 2 GB the
+JVM dies (**OOM** — out of memory). One record also means one consumer (no
+parallelism) and a crash at line 800,000 restarts from line 1.
+
+**The fix — split manifest, "virtual parts":**
 
 ```mermaid
 flowchart TD
-    A[IngestRequest pointer] --> B[stream file back from B2]
-    B --> C["TimeWindowChunker:<br/>split ~18k lines into ~30 x 60s windows"]
-    C --> D["Layer-1 parsers per window<br/>(SQL, API, Error, Perf, Auth, Traffic, Lifecycle...)"]
-    D --> E["AnomalyDetector:<br/>flag windows w/ exceptions, WARN bursts, latency > 3x p95"]
-    E --> F["INSERT ALL windows into log_chunks_s_&lt;s-42&gt;<br/>(embedding = NULL, is_anomalous set)"]
-    E --> G["UPSERT exact numbers into log_metrics"]
-    F --> H["EnrichProducer.produce → llm.enrich.requests"]
-    G --> H
-    H --> I[delete staged file from B2, mark doc COMPLETED]
+    A["log.ingest.requests: pointer to the 120 MB object"] --> S[SPLITTER]
+    S -->|"ONE streaming pass, O(1) memory:<br/>tracks byte offsets line by line,<br/>finds window boundaries via timestamps"| M["split manifest:<br/>24 window-aligned byte ranges"]
+    M -->|"documents.total_parts = 24"| DB[(Postgres)]
+    M -->|"24 tiny messages<br/>{fileUrl, byteStart, byteEnd, firstLine}"| K2{{"log.ingest.parts<br/>6 partitions"}}
 ```
 
-### 5a. Chunking
-`TimeWindowChunker` groups lines into 60-second buckets. Multi-line stack traces stay
-with their parent line. Result: **~30 windows**, each a `LogWindow{ chunkId, timeBucket,
-lineStart, lineEnd, content, isAnomalous=false }`.
+The splitter reads the file top-to-bottom **once**, holding only the current line.
+It notes "a new 60-second window starts at byte 5,242,912," and every ~5 MB it marks
+a **cut at a window boundary**. It writes NOTHING back to blob — each Kafka message
+just says: *"process bytes X–Y of the original object; your first line number is N."*
 
-### 5b. Parsing (Layer 1 — deterministic, no LLM)
-Each window is run through **every** parser. These compute **exact** numbers
-(counts, sums, p95 latency) — *computed, never generated by an LLM*. Example output for
-the 10:05 window: `{category=DATABASE, metric=sql_failures, count=14}`,
-`{category=PERFORMANCE, metric=http_latency, p95_ms=4200}`.
+> **📖 plain words — streaming / O(1) memory:** reading a file like a river — look at
+> each line as it flows past, keep almost nothing. Memory stays flat whether the file
+> is 1 MB or 10 GB. ("O(1)" = constant — doesn't grow with input size.)
 
-### 5c. Anomaly detection (the gate)
-`AnomalyDetector` marks a window `is_anomalous = true` if it has an intrinsic problem
-(exception / OOM / deadlock) **or** ≥5 WARN lines **or** latency > 3× the corpus p95.
-In our file, the **10:05 window** trips it; the other ~29 are normal.
+**Decision 1:** *why virtual parts (byte ranges) instead of physically cutting the
+file into 24 small blob objects?* Physical parts re-write 100% of the bytes —
+double storage, double API calls — for zero benefit, since a ranged GET fetches a
+slice either way. **We index split points; we don't copy data.** Same idea as input
+splits in Hadoop/Spark.
 
-### 5d. Storage — **ALL chunks, not just anomalies**
+**Decision 2:** *why must cuts land on window boundaries?* A blind "every 5 MB" cut
+could slice a 60-second window — or a multi-line stack trace — across two parts.
+Cutting only where a new window begins makes every part self-contained, so parts
+can be processed in any order, in parallel, with **zero coordination**.
 
-`SessionChunkRepository.insertBatch` writes **every** window into the per-session table
-(500 rows/batch). This is the point people get wrong: normal windows are stored too —
-they're just marked `is_anomalous=false`. You need them so the RAG chat in §8 can answer
-questions about *any* part of the log, not only incidents.
-
-**`log_chunks_s_<s-42>`** after ingest (embeddings still NULL):
-
-| chunk_id | time_bucket | line_start–end | content (excerpt) | embedding | is_anomalous |
-|---|---|---|---|---|---|
-| `c-01` | 10:00 | 1–540 | `...INFO request ok...` | NULL | false |
-| … | … | … | … | NULL | false |
-| **`c-06`** | **10:05** | **3200–3980** | `...SQLException: deadlock... 14x...` | NULL | **true** |
-| … | … | … | … | NULL | false |
-| `c-30` | 10:29 | 17800–18000 | `...INFO shutdown...` | NULL | false |
-
-**`log_metrics`** (global, keyed for idempotent upsert) — the exact numbers:
-
-| session_id | time_bucket | category | metric | count | p95_ms | sample_chunk_ids |
-|---|---|---|---|---|---|---|
-| s-42 | 10:05 | DATABASE | sql_failures | 14 | – | {c-06} |
-| s-42 | 10:05 | PERFORMANCE | http_latency | 512 | 4200 | {c-06} |
-| s-42 | 10:01 | API | ff_api_calls | 300 | 90 | {c-01} |
-
-PK `(session_id, time_bucket, category, metric)` → a redelivered Kafka message upserts the
-same row instead of double-counting. Index: `idx_metrics_session_cat`.
-
-### 5e. Fan-out to the enrich lane
-`EnrichProducer.produce` emits work items to **`llm.enrich.requests`**:
-- **1 × `ENRICH_WINDOW`** per **anomalous** window → here **1** (only `c-06`).
-- **1 × `EMBED_BATCH`** per **10 chunks across ALL windows** → 30 chunks → **3** batches.
-
-So `total_windows` (the completion target) = anomalous(1) + embedBatches(3) = **4 work items**.
-It's set on the session **before** producing, so the counter has a correct target immediately.
-Then the staged file is **deleted from B2** (`staged_file_deleted=true`) and the document is
-marked `COMPLETED`.
+**Decision 3:** *why is the parts topic keyed per-part, not per-document?* Keying by
+document would send all 24 parts to one partition = one consumer = no parallelism.
+Per-part keys spread them across all 6 partitions.
 
 ---
 
-## 6. Enrich workers  →  embeddings (all chunks) + narratives (anomalies) — **partition-per-key**
+## 6. Part consumers — chunk → parse → flag → ONE safe transaction
 
-This is the LLM lane. `EnrichConsumer` (group `llm-workers`) runs with
-**concurrency = number of API keys = 5**, and the topic has **5 partitions**. Work items
-are spread by a hash of their `workId`, so **each partition ≈ one Gemini key**, and each
-consumer self-paces to *its own* key's rate limit — **no shared rate-limit coordination**.
+Several consumers work the parts topic in parallel. Per part:
+
+1. **Ranged GET** — fetch only bytes X–Y from B2. Memory = one part (~5 MB), never
+   the file.
+2. **Chunk** — group the part's lines into 60-second windows (`TimeWindowChunker`).
+   Multi-line stack traces stay glued to their first line. (Files with no timestamps
+   at all fall back to fixed 500-line windows.)
+3. **Parse — "Layer 1", deterministic, zero LLM** — every window runs through seven
+   regex parsers: SQL (queries, failures, deadlocks), API (endpoints, latencies),
+   Errors (exception types), Performance (GC pauses, thread pools), Auth (401/403),
+   Traffic (volumes), Lifecycle (restarts, deploys). Output = **exact numbers**:
+   the 10:05 window yields `{DATABASE, sql_failures, count=14}` and
+   `{PERFORMANCE, http_latency, p95_ms=4200}`. *Numbers are computed, never
+   generated* — no LLM ever counts anything in this system.
+4. **Local anomaly rules** — flag the window if it contains an exception / OOM /
+   deadlock line, or ≥5 WARNs. (The third rule — latency outliers — needs the whole
+   corpus, so it waits for §7.)
+5. **One short transaction** writes everything atomically:
+   - a **marker row** `(document_id, part_idx)` into `ingest_parts`,
+     `ON CONFLICT DO NOTHING` — if it already exists, Kafka redelivered this part:
+     **skip everything, just ack**;
+   - the part's chunks into `log_chunks_s_<s-42>`;
+   - the exact numbers upserted into `log_metrics`;
+   - `parsed_parts = parsed_parts + 1` on the document.
+
+> **📖 plain words — transaction:** an all-or-nothing group of database writes;
+> crash halfway = as if it never started.
+>
+> **📖 plain words — at-least-once delivery:** Kafka promises "you'll get every
+> message *at least* once" — after a crash it may hand you the same message again.
+> So every handler must be idempotent. The marker-in-the-same-transaction makes a
+> redelivered part a no-op: **exactly-once EFFECT built on at-least-once delivery.**
+> (That phrase is interview gold — use it.)
+>
+> **📖 plain words — upsert:** insert, or if the row exists, update it — one SQL
+> statement (`ON CONFLICT … DO UPDATE`).
+
+**Decision:** *why parse first and keep the transaction tiny?* A DB connection held
+open during slow work (network reads, parsing) starves the connection pool. House
+rule everywhere in this codebase: **short TX → slow work with no TX → short TX.**
+
+**`log_metrics`** after all parts (the exact-numbers table):
+
+| session | time_bucket | category | metric | count | p95_ms |
+|---|---|---|---|---|---|
+| s-42 | 10:05 | DATABASE | sql_failures | 14 | – |
+| s-42 | 10:05 | PERFORMANCE | http_latency | 512 | 4200 |
+| s-42 | 10:01 | API | ff_api_calls | 300 | 90 |
+
+---
+
+## 7. The FINALIZER — the "everyone's done" step
+
+When a part's transaction bumps `parsed_parts` to `total_parts` (24/24), that
+consumer triggers the finalizer. The claim is **atomic**:
+`UPDATE … WHERE parsed_parts = total_parts AND status = 'PROCESSING'` — the database
+lets exactly ONE caller win that update, so the finalizer runs once even if two
+parts finish in the same instant.
+
+> **📖 plain words — completion counter + atomic claim:** no "boss" process watches
+> for completion; every worker increments a counter and asks "am I the one who
+> finished it?" The conditional UPDATE is the referee. No coordinator to crash,
+> works under redelivery.
+
+The finalizer then:
+1. **Runs the global anomaly rule:** one SQL `percentile_cont(0.95)` over
+   `log_metrics` computes the corpus's 95th-percentile latency; every window whose
+   latency exceeds **3×** that gets `is_anomalous = true`. Here: 10:05's 4200ms vs
+   a corpus p95 of ~120ms → flagged.
+2. **Fans out the LLM work** (§8) and sets the completion target:
+   `total_windows += anomalous(1) + embed_batches(3) = 4`.
+3. Session → `ENRICHING`; **deletes the staged file from B2** — the chunks in
+   Postgres are now the durable copy; blob was only ever temporary parking.
+
+> **📖 plain words — p95 / percentile:** the value 95% of samples sit below — the
+> experience of your slowest 1-in-20 requests. "3× corpus p95" = dramatically slower
+> than this system's own normal, whatever that normal is.
+
+**Decision:** *why can't parts do the latency rule themselves?* It's a **global**
+statistic and parts are deliberately independent. Local rules flag locally; the
+global rule runs once, in SQL, over data already in Postgres. (Two-phase statistics
+— the same reason MapReduce has a *reduce* step.)
+
+---
+
+## 8. The LLM lanes — embeddings for ALL chunks, narratives for ANOMALIES
+
+The most-misunderstood section. Two different kinds of work item go onto
+`llm.enrich.requests`:
+
+- **`EMBED_BATCH`** — *every* chunk gets embedded (30 chunks, 10 per batch → 3 items).
+  Needed so the chat in §11 can answer about ANY minute, not just incidents.
+- **`ENRICH_WINDOW`** — *only anomalous* windows (just `c-06` → 1 item) go to a chat
+  LLM for a structured explanation.
+
+**The anomaly gate is the cost control:** embeddings scale with log *volume* (cheap
+calls); narratives scale with *incidents* (expensive calls). A 10× traffic day is
+NOT a 10× LLM bill.
 
 ```mermaid
 flowchart LR
-    subgraph Kafka llm.enrich.requests
-      P0[partition 0]:::p
-      P1[partition 1]:::p
-      P2[partition 2]:::p
-      P3[partition 3]:::p
-      P4[partition 4]:::p
+    subgraph "llm.enrich.requests — 5 partitions"
+      P0[p0] --> C0["consumer 0 = key #1"]
+      P1[p1] --> C1["consumer 1 = key #2"]
+      P2[p2] --> C2["consumer 2 = key #3"]
+      P3[p3] --> C3["consumer 3 = key #4"]
+      P4[p4] --> C4["consumer 4 = key #5"]
     end
-    P0 --> C0["consumer 0<br/>Gemini key #1"]
-    P1 --> C1["consumer 1<br/>Gemini key #2"]
-    P2 --> C2["consumer 2<br/>Gemini key #3"]
-    P3 --> C3["consumer 3<br/>Gemini key #4"]
-    P4 --> C4["consumer 4<br/>Gemini key #5"]
-    classDef p fill:#eef;
 ```
 
-Two kinds of work item:
+**Partition-per-key:** the topic has exactly as many partitions as API keys; each
+consumer owns one partition ↔ one key and paces itself to that key's limits. Since
+Kafka guarantees one-consumer-per-partition, **rate limiting needs no locks and no
+coordination** — and the invariant survives adding machines.
 
-| Work item | What the worker does | Writes to |
+**Proactive budgets (`EmbeddingKeyPool`):** every key tracks its own rolling
+60-second window of requests AND tokens; a call is dispatched only when the chosen
+key has budget for it. **429s don't happen by construction.** If one slips through
+anyway (shared quotas, clock skew), the key is benched 15s and the call rotates to
+another key.
+
+> **📖 plain words — rate limits / RPM / TPM / RPD / 429:** free AI APIs cap each
+> key: requests-per-minute, tokens-per-minute (a token ≈ a word-piece, ~4 chars),
+> requests-per-day. Exceed any → HTTP **429 "Too Many Requests"**. Hard-earned
+> lesson here: the three limits need *different* responses — a per-minute 429 is
+> retryable; retrying a per-day 429 is actively harmful because failed calls still
+> count against the day.
+
+**The failure ladder (memorize the order):**
+1. 429 anyway → item parked on `llm.enrich.retry.60s` with a "not-before ⏰" stamp;
+   the consumer moves on immediately (a lane never sleeps holding work).
+2. `RetryConsumer` re-releases it after the stamp → back to the main topic.
+3. Rate-limited work retries for up to ~24h — **quota exhaustion delays work, it
+   never loses it** (survives even the daily quota reset).
+4. Genuinely broken ("poison") items → **DLQ** after 3 attempts.
+5. **Every** terminal outcome — success or DLQ — bumps `enriched_windows`, so one
+   bad item can never freeze the completion counter.
+
+> **📖 plain words — DLQ (dead-letter queue):** the parking lot for messages that
+> keep failing — set aside for a human, neither retried forever nor silently
+> dropped. — **backpressure / lag:** when producers outpace consumers, work piles
+> up *safely* in the queue; the queue length ("lag") is your health metric.
+
+**Writes:** embeddings fill `log_chunks….embedding`; narratives land in
+**`log_findings`**: *"{DATABASE, CRITICAL, 'Deadlock storm on checkout',
+evidence: {c-06}}"* — **deduplicated by fingerprint** (a hash of category +
+normalized title, unique per session): the same anomaly seen again bumps
+`occurrence_count` instead of creating a duplicate row.
+
+When `enriched_windows == total_windows` (4/4): atomic flip → `CORRELATING`, and
+the backend calls the Python orchestrator.
+
+---
+
+## 9. Graph 1 — correlation & report (and the whole LangGraph justification)
+
+`POST /analyze/s-42` → the orchestrator runs:
+
+```
+load findings + metrics
+→ cluster (pure Python: same category, time ranges within 5 min)
+→ per cluster: correlate  — LLM writes narrative + root-cause hypothesis
+→ ground_check            — a second LLM judges: "is every claim supported
+      ├─ no → regenerate     by the evidence chunks?" (bounded retries)
+      └─ yes → accept
+→ write incidents → compose report → save → session DONE
+```
+
+- Clustering is **plain code** — grouping by category/time needs no AI.
+- `ground_check` is the anti-hallucination valve: a narrative that invents facts
+  beyond its evidence gets rejected and regenerated.
+
+> **📖 plain words — LangGraph, and why a "graph" not a "chain":** a chain is a
+> straight pipeline (A→B→C) that can never go backwards. Our flow has **loops** —
+> "regenerate until grounded (max N)", "rewrite the question and re-search" — i.e.
+> conditional jumps backwards, which need carried state. A graph is the natural
+> shape for that. Everything WITHOUT loops (chunking, parsing, clustering) stays
+> plain code. That one sentence is the entire LangGraph justification.
+>
+> **📖 plain words — LLM-as-judge:** using a second model call to *verify* a first
+> one — here, "does the evidence support every claim?"
+
+Writes: **`incidents`** (*"10:05–10:07 — deadlock storm on checkout; root cause:
+lock contention on payments table"*, with `finding_ids`) and **`reports`** (one
+markdown + JSON report per session). Session → **DONE**.
+
+---
+
+## 10. Live progress — SSE the whole way
+
+The frontend holds one open connection: `GET /sessions/s-42/progress`, and the
+server pushes every status change:
+`CHUNKING → PARSING (parts 7/24) → ENRICHING (2/4) → CORRELATING → REPORTING → DONE`.
+
+> **📖 plain words — SSE (Server-Sent Events):** a one-way live stream from server
+> to browser over plain HTTP — the server pushes whenever it wants. WebSocket's
+> simpler cousin (WebSocket is two-way; a progress bar needs one-way). Ours streams
+> the session's status row — no extra infrastructure, the DB row is already the truth.
+
+---
+
+## 11. Alice asks questions — the three-tier query surface
+
+Cheapest tier first:
+
+| Tier | Question style | Answered by | Cost |
+|---|---|---|---|
+| 1 | "how many SQL failures, when?" | plain SQL over `log_metrics` / `log_findings` / `incidents` | milliseconds, **zero LLM** — hallucination *impossible*, nothing is generated |
+| 2 | "what happened overall?" | the pre-built report | milliseconds |
+| 3 | "why did checkout fail around 10:05?" | **Graph 2** drill-down (below) | seconds, 2–3 LLM calls |
+
+**Graph 2:** `retrieve → grade → (weak? rewrite → retrieve)* → generate`
+
+1. **Hybrid retrieve** over ONLY `log_chunks_s_<s-42>`: embed the question → HNSW
+   nearest-neighbor search, **UNION** a GIN keyword search, de-dup. Two different
+   nets: vectors catch *meaning* ("checkout failing" ≈ the deadlock window);
+   keywords catch *exact tokens* ("SQLException", request IDs) that embeddings blur.
+2. **Grade** — an LLM judges which retrieved chunks actually bear on the question.
+3. **Rewrite loop** — weak results → rephrase, search again (bounded; a remembered
+   `best_docs` guarantees we never answer from nothing).
+4. **Generate** — answer **strictly from the retrieved chunks**, returning the
+   `chunk_id`s used. The frontend maps citations → `line_start–line_end` → shows the
+   actual log lines. Turns persist in `drilldown_messages` (chat survives reload).
+
+> **📖 plain words — RAG (Retrieval-Augmented Generation):** don't let the AI answer
+> from memory; first *retrieve* relevant source material, then have it answer
+> *grounded in that material*, citing it. Our twist — most RAG work happened once at
+> ingest ("**ingest-time RAG**"), so questions hit precomputed tables; this
+> drill-down is the only query-time RAG path.
+
+---
+
+## 12. The whole picture
+
+```mermaid
+flowchart TD
+    FE[React] -->|upload| UP[DocumentController]
+    UP -->|stream file| B2[(B2 blob)]
+    UP -->|pointer| K1{{log.ingest.requests}}
+    K1 --> SP["SPLITTER: 1 streaming pass →<br/>window-aligned byte ranges"]
+    SP -->|24 part pointers| KP{{log.ingest.parts}}
+    KP --> PC["part consumers (parallel):<br/>ranged GET → chunk → parse →<br/>1 TX: marker+chunks+metrics+counter"]
+    PC -->|"24/24 → atomic claim"| FIN["FINALIZER: SQL p95 rule →<br/>fan-out → delete staged file"]
+    FIN --> K2{{"llm.enrich.requests<br/>5 partitions = 5 keys"}}
+    K2 --> EC["enrich consumers:<br/>embeddings (all) + narratives (anomalies)<br/>budget pool · retry lane · DLQ"]
+    EC -->|"counter 4/4"| OR["Graph 1: cluster → correlate →<br/>ground_check → incidents → report"]
+    FE <-->|SSE progress| ST[session status row]
+    FE -->|questions| Q["Tier 1 SQL · Tier 2 report · Tier 3 Graph 2 RAG"]
+```
+
+Tables: `users` · `sessions` (status + counters) · `documents` (+ part counters) ·
+`ingest_parts` (redelivery markers) · **`log_chunks_s_<id>`** (per session:
+content + vectors + flags; HNSW + GIN + time indexes) · `log_metrics` (exact
+numbers) · `log_findings` (LLM insights, fingerprint-deduped) · `incidents` ·
+`reports` · `drilldown_messages`.
+
+---
+
+## 13. Every decision in one line (your rapid-fire round)
+
+| Decision | Why | Rejected alternative & why |
 |---|---|---|
-| **`EMBED_BATCH`** (all chunks) | read chunk `content`, call Gemini `gemini-embedding-001` (outputDim **768**), get vectors | `UPDATE log_chunks_s_<s-42> SET embedding = ?::vector WHERE chunk_id = ?` |
-| **`ENRICH_WINDOW`** (anomalies only) | send the anomalous window to **Groq** LLM → structured insight (title, explanation, severity) | `INSERT INTO log_findings` (deduped by fingerprint) |
-
-After this stage, **`log_chunks_s_<s-42>.embedding` is populated for every row** (the HNSW
-index now has 30 vectors), and `log_findings` has the incident insight:
-
-**`log_findings`** (Layer-2 LLM output, grounded to chunk ids):
-
-| id | session_id | category | severity | title | evidence_chunk_ids | fingerprint | occurrence_count |
-|---|---|---|---|---|---|---|---|
-| `f-1` | s-42 | DATABASE | CRITICAL | "Deadlock storm on checkout" | {c-06} | `sha…` | 1 |
-
-- `uq_finding_fingerprint (session_id, fingerprint)` → the *same* anomaly seen again just
-  bumps `occurrence_count`, no duplicate row.
-
-**Backpressure / reliability on this lane:**
-- A Gemini 429 → the item is parked on `llm.enrich.retry.60s` and re-released after a delay
-  (it doesn't block the partition).
-- Exhausted retries / poison → `llm.enrich.dlq`.
-- `enable-auto-commit=false` + manual ack → an offset is committed **only after** the DB
-  write, so delivery is **at-least-once** and a crash just redelivers.
-- **Completion counter:** every terminal work item increments `enriched_windows`. When
-  `enriched_windows == total_windows`, `EnrichCompletion` flips the session to
-  `CORRELATING` and calls the orchestrator (§7).
-
-> ⚠️ **Known live bug you just fixed:** `max.poll.records` defaulted to 500 while each
-> `EMBED_BATCH` can block up to ~90s in `EmbeddingKeyPool.acquire()`, so a poll batch blew
-> past `max.poll.interval.ms` → rebalance storm → offsets never committed → **embeddings
-> stayed NULL**. Fix: `max.poll.records=1`. (Requires a Render redeploy to take effect.)
+| Async behind Kafka, 202 upload | user never waits on heavy work | synchronous — minutes-long requests, timeouts |
+| Claim-check (pointers in Kafka) | brokers move facts, not files | content-in-Kafka — 1MB caps, double storage, retention conflicts |
+| Kafka event, not table polling | push, instant, no locks | v1's poller — 3s latency + lease columns; deleted for cause |
+| Virtual parts (byte ranges) | O(part) memory, zero extra I/O | whole-file read — OOM; physical part files — rewrite 100% of bytes |
+| Window-aligned cuts | parts self-contained, zero coordination | blind byte cuts — halved windows / stack traces |
+| Marker-in-TX per part | exactly-once effect on at-least-once | hope-based dedup — double counts on redelivery |
+| Counter + atomic claim | exactly-one finalizer, no coordinator | a watcher process — extra moving part, crash risk |
+| Global p95 in finalizer | it's a corpus statistic | per-part p95 — mathematically wrong |
+| Two-layer extraction | numbers computed, never generated | "ask the LLM to count" — wrong, slow, expensive |
+| Anomaly gate before LLM | LLM cost scales with incidents, not volume | enrich everything — 10× logs = 10× spend |
+| Partition-per-key lanes | rate limits with zero locks, scales out | shared pool + mutex — contention; breaks multi-instance |
+| Proactive token budgets | 429s designed out | retry storms — lived it; burned daily quota producing nothing |
+| Retry topic + DLQ + never-drop | delay ≠ loss; poison parked, not looped | drop after N — silent holes in the corpus |
+| Per-session chunk tables | small dedicated HNSW; no filtered-ANN trap | shared vectors table — recall collapses at scale |
+| Postgres for vectors too | one system of truth, transactional | dedicated vector DB — a second store to keep in sync |
+| SQL-first query surface | ms answers, hallucination impossible | LLM answers everything — slow, costly, unverifiable |
+| LangGraph only where loops live | ground-check & rewrite need cycles | graphs everywhere — ceremony; chains — can't loop |
+| SSE from the status row | the DB row is already the truth | WebSocket / status topic — two-way machinery for one-way data |
 
 ---
 
-## 7. Correlation & report  →  LangGraph **Graph 1**  →  `incidents` + `reports`
+## 14. Glossary cheat-sheet (one line each)
 
-When enrichment finishes, the Java side flips status to `CORRELATING` and `POST`s to the
-orchestrator: `POST /analyze/s-42` (returns `202`; runs in the background).
-
-**Graph 1** (`graph_analyze.py`):
-`load → cluster → (correlate → ground_check)* → write_incidents → compose_report → save_report`
-
-```mermaid
-flowchart LR
-    L[load findings + top metrics] --> CL["cluster findings<br/>(pure python, by category + 300s overlap)"]
-    CL --> CO[correlate cluster → narrative + root cause  LLM]
-    CO --> GC{ground_check:<br/>LLM-as-judge<br/>grounded?}
-    GC -- no, retry --> CO
-    GC -- yes --> WI[write_incidents]
-    WI --> RP["compose_report [REPORTING]"]
-    RP --> SV["save_report [DONE]"]
-```
-
-- **Clustering is pure Python** (no LLM): findings in the same category whose time ranges
-  overlap within 300s become one incident.
-- **`ground_check` is an LLM-as-judge loop with a bounded recursion budget** sized to the
-  finding count — regenerate-or-accept per cluster so a narrative can't hallucinate beyond
-  its evidence. *This cyclic, conditional control flow is exactly why LangGraph is used
-  here instead of a straight-line chain.*
-
-Writes:
-
-**`incidents`**: `{ session_id=s-42, time_range=10:05–10:07, finding_ids={f-1}, narrative="A deadlock storm…", root_cause_hypothesis="…" }`
-**`reports`** (one per session, PK=session_id): `content_md` + `content_json`.
-
-Session status → **`DONE`**. The SSE stream tells the frontend to render metrics charts,
-findings, incidents, and the report.
+**Topic / partition / offset** — Kafka's queue / its parallel sub-queues / your bookmark in one.
+**Consumer group** — a team of readers; each partition served by exactly one member.
+**Claim-check** — park the big payload in storage; pass a small ticket through the queue.
+**Ranged GET** — "give me bytes X–Y of that object."
+**Idempotent** — safe to repeat; same end state.
+**At-least-once** — delivery may duplicate → handlers must be idempotent.
+**Upsert** — insert-or-update in one statement.
+**Transaction** — all-or-nothing group of writes.
+**Embedding / cosine** — meaning as 768 numbers / similarity of two meanings.
+**HNSW / GIN** — fast approximate vector search / fast keyword search.
+**Filtered ANN** — search a shared vector index, then filter — the recall trap per-session tables avoid.
+**RPM / TPM / RPD / 429** — per-minute requests / per-minute tokens / per-day requests / "too many requests."
+**Backpressure / lag** — queues absorbing overload / queue length as the health metric.
+**DLQ** — parking lot for poison messages.
+**p95** — the value 95% of samples sit below.
+**Fingerprint dedup** — hash of an insight's identity; repeats bump a counter, not a row.
+**SSE** — one-way server→browser live stream.
+**RAG / ingest-time RAG** — retrieve-then-generate with citations / doing that work once at ingest.
+**LLM-as-judge / ground-check** — a second model verifying claims against evidence.
+**OOM** — out of memory; the crash the parts design exists to prevent.
 
 ---
 
-## 8. Alice asks a question  →  LangGraph **Graph 2** (corrective-RAG)
-
-Now the interactive part. Alice types **"why did checkout fail around 10:05?"** in the chat.
-
-```mermaid
-sequenceDiagram
-    participant FE as React chat
-    participant BE as AnalysisQueryController
-    participant OR as Orchestrator (Graph 2)
-    participant DB as Postgres (log_chunks_s_s-42)
-    FE->>BE: POST /sessions/s-42/drilldown {question}
-    BE->>OR: POST /drilldown {session_id, question}
-    OR->>DB: hybrid retrieve (HNSW kNN ∪ GIN full-text)
-    OR->>OR: grade → (weak? rewrite → retrieve)* → generate
-    OR-->>BE: { answer, citations:[c-06] }
-    BE->>DB: INSERT INTO drilldown_messages (persist turn)
-    BE-->>FE: { answer, citations }
-```
-
-**Graph 2** (`graph_drilldown.py`): `retrieve → grade → (weak? rewrite → retrieve)* → generate`
-
-1. **retrieve** (`db.retrieve_chunks`) — **hybrid recall** over *only this session's* table:
-   - embed the question (Gemini) → **HNSW kNN**:
-     `ORDER BY embedding <=> %s::vector LIMIT k` (cosine) — uses `idx_lc_<tid>_hnsw`.
-   - **GIN full-text**:
-     `to_tsvector('simple',content) @@ websearch_to_tsquery(...)` — uses `idx_lc_<tid>_fts`.
-   - **UNION, de-duplicated by `chunk_id`.** (Fallback: if FTS's AND-match finds nothing,
-     retry with an OR of the terms; if there's no embedding, FTS-only.)
-2. **grade** — an LLM judges which retrieved chunks are actually relevant.
-3. **rewrite** — if the grade is weak, rewrite the question and retrieve again (bounded by
-   `MAX_REWRITES`). A remembered `best_docs` guarantees we never answer from nothing.
-4. **generate** — answer **grounded strictly in the retrieved chunks**, returning the
-   **`chunk_id`s it cited** (e.g. `c-06`). *The retry/rewrite cycle is the "corrective" in
-   corrective-RAG — again, a graph, not a linear chain.*
-
-For our question, retrieval surfaces **`c-06`** (the 10:05 deadlock window) via both the
-vector and keyword paths; the answer cites it, and the frontend can show the exact log
-lines (`line_start–line_end` → the original file range).
-
-**`drilldown_messages`** (persisted so chat history survives reload/logout):
-
-| id | session_id | question | answer | citations | created_at |
-|---|---|---|---|---|---|
-| `m-1` | s-42 | why did checkout fail around 10:05? | "A database deadlock storm…" | {c-06} | 10:32 |
-
-Index: `idx_drilldown_session (session_id, created_at)`.
-
----
-
-## 9. The whole picture on one page
-
-```mermaid
-flowchart TD
-    subgraph Client
-      FE[React / Vercel]
-    end
-    subgraph Backend[Spring Boot / Render]
-      UP[DocumentController] 
-      IC[IngestConsumer]
-      EC[EnrichConsumer x5]
-      QC[AnalysisQueryController]
-    end
-    subgraph Infra
-      B2[(Backblaze B2)]
-      K1{{log.ingest.requests}}
-      K2{{llm.enrich.requests<br/>5 partitions = 5 keys}}
-      OR[Orchestrator / LangGraph]
-    end
-    subgraph Postgres
-      T1[[users]]
-      T2[[sessions]]
-      T3[[documents]]
-      T4[[log_chunks_s_<id><br/>HNSW+GIN+time]]
-      T5[[log_metrics]]
-      T6[[log_findings]]
-      T7[[incidents / reports]]
-      T8[[drilldown_messages]]
-    end
-
-    FE -->|login| T1
-    FE -->|create session| T2
-    FE -->|create session| T4
-    FE -->|upload| UP
-    UP -->|raw file| B2
-    UP --> T3
-    UP -->|pointer| K1
-    K1 --> IC
-    IC -->|stream back| B2
-    IC -->|all chunks| T4
-    IC -->|exact metrics| T5
-    IC -->|work items| K2
-    K2 --> EC
-    EC -->|embeddings all chunks| T4
-    EC -->|LLM narrative anomalies| T6
-    EC -->|done| OR
-    OR --> T7
-    FE -->|ask question| QC
-    QC --> OR
-    OR -->|hybrid retrieve| T4
-    QC --> T8
-```
-
----
-
-## 10. Table map (which table holds what, and its indexes)
-
-| Table | Scope | Holds | Key indexes | Written by |
-|---|---|---|---|---|
-| `users` | global | accounts | `idx_users_email` | auth |
-| `sessions` | global | one corpus/workspace + status + completion counter | `idx_sessions_user` | API |
-| `documents` | global | one uploaded file, blob URL, status | `idx_documents_session`, `uq_doc_per_session` | upload |
-| **`log_chunks_s_<id>`** | **per session** | every 60s window: content + `vector(768)` + anomaly flag | **HNSW**(embedding), **GIN**(content FTS), B-tree(time) | ingest (rows) + enrich (embeddings) |
-| `log_metrics` | global | exact Layer-1 numbers per window | `idx_metrics_session_cat`, PK upsert | ingest |
-| `log_findings` | global | Layer-2 LLM insights, grounded | `idx_findings_session`, `uq_finding_fingerprint` | enrich |
-| `incidents` | global | correlated episodes (Graph 1) | `idx_incidents_session` | orchestrator |
-| `reports` | global | one final report per session | PK=session_id | orchestrator |
-| `drilldown_messages` | global | persisted Q&A chat (Graph 2) | `idx_drilldown_session` | query |
-
----
-
-## 11. Fast facts to anchor decisions
-
-- **Two Kafka lanes, never raw logs:** `log.ingest.requests` (pointer) and
-  `llm.enrich.requests` (chunk-id work items, 5 partitions). Each has a DLQ; enrich also
-  has a `retry.60s` topic.
-- **Blob storage is staging only:** the file is deleted after successful ingest
-  (`staged_file_deleted=true`). Postgres is the durable store from then on.
-- **Two independent bursts:** embeddings scale with **log volume** (every chunk),
-  narratives scale with **anomalies** (~10–15% of windows). The gate keeps the *expensive*
-  LLM bounded even when volume explodes.
-- **At-least-once everywhere:** manual offset commit after the DB write; every write is
-  idempotent (upsert keys / fingerprints / duplicate-doc constraint) so redelivery is safe.
-- **Per-session table = per-session HNSW.** Biggest structural bet; exit strategy is hash
-  partitioning if table count becomes a problem.
-- **LangGraph is used for the two places that need cycles + conditional routing:** the
-  ground-check loop (Graph 1) and the grade→rewrite→re-retrieve loop (Graph 2). Everything
-  deterministic (chunking, parsing, clustering) is plain code, no graph.
-
-## 12. Honest current-state caveats (for your decisions)
-
-- **Ingest loads the whole file into heap** (`readAllLines` → `List<String>`). Fine for
-  MB files; a true multi-GB file would OOM. "Streaming, memory-safe ingest" is *not* true
-  yet — it's a code change (stream window-by-window) if you want to claim it.
-- **Embedding throughput is the real ceiling** on free tier (~6k chunks/hr across 5 keys);
-  10⁶-chunk corpora need a paid tier or a local embed model — architecture unchanged.
-- **`max.poll.records=1` fix** must be deployed (Render redeploy) for embeddings to persist.
+*Companions: decision defenses with numbers → [interview/02-design-defense.md](interview/02-design-defense.md) ·
+honest self-critique → [interview/03-honest-tradeoffs.md](interview/03-honest-tradeoffs.md) ·
+scale math → [interview/05-scale-math.md](interview/05-scale-math.md) ·
+implementation spec for §5–§7 → [04-partitioned-ingest-spec.md](04-partitioned-ingest-spec.md)*
