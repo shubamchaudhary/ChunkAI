@@ -101,16 +101,15 @@ public class GeminiClient {
                             + "rotating immediately", dailyExhausted.size(), keyCount);
                         continue;
                     }
-                    String next = resolveEmbeddingKey(apiKey);   // advance to another key
-                    boolean sameKey = next.equals(keyToUse);
-                    log.warn("batchEmbedContents 429 (attempt {}/{}), {} key{}",
-                        attempt + 1, maxAttempts,
-                        sameKey ? "same" : "rotating to another",
-                        sameKey ? " — waiting " + config.getRateLimitRetryDelayMs() + "ms" : "");
-                    keyToUse = next;
-                    if (sameKey) {
-                        sleepQuietly(config.getRateLimitRetryDelayMs());
-                    }
+                    // Per-minute (RPM/TPM) 429: rotate AND pace. Sleeping only on
+                    // same-key wraps let a 5-key cycle finish in ~a second, burning
+                    // all attempts inside the same saturated TPM minute; a short
+                    // sleep every rotation makes 25 attempts span ~50s, guaranteeing
+                    // the retry crosses into a fresh minute window.
+                    keyToUse = resolveEmbeddingKey(apiKey);
+                    log.warn("batchEmbedContents 429 (attempt {}/{}) — rotating key, waiting {}ms",
+                        attempt + 1, maxAttempts, config.getRateLimitRetryDelayMs());
+                    sleepQuietly(config.getRateLimitRetryDelayMs());
                     continue;
                 }
                 if (status == 403) {
@@ -197,16 +196,11 @@ public class GeminiClient {
                             dailyExhausted.size(), keyCount);
                         continue;
                     }
-                    String next = resolveEmbeddingKey(apiKey);
-                    boolean sameKey = next.equals(keyToUse);
-                    log.warn("embedContent 429 (attempt {}/{}), {} key{}",
-                        attempt + 1, maxAttempts,
-                        sameKey ? "same" : "rotating to another",
-                        sameKey ? " — waiting " + config.getRateLimitRetryDelayMs() + "ms" : "");
-                    keyToUse = next;
-                    if (sameKey) {
-                        sleepQuietly(config.getRateLimitRetryDelayMs());
-                    }
+                    // Per-minute 429: rotate AND pace (see batchGenerateEmbeddings).
+                    keyToUse = resolveEmbeddingKey(apiKey);
+                    log.warn("embedContent 429 (attempt {}/{}) — rotating key, waiting {}ms",
+                        attempt + 1, maxAttempts, config.getRateLimitRetryDelayMs());
+                    sleepQuietly(config.getRateLimitRetryDelayMs());
                     continue;
                 }
                 if (status == 403) {
@@ -358,15 +352,25 @@ public class GeminiClient {
     }
 
     /**
-     * Distinguishes a daily-quota 429 from a per-minute rate-limit 429. Gemini's
-     * per-minute limit responses carry a {@code retryDelay} hint (retrying after
-     * the delay succeeds); daily {@code RESOURCE_EXHAUSTED} responses do not — so
-     * callers rotate keys without sleeping and fail fast once every key is
-     * daily-exhausted, instead of burning ~45s retrying a futile daily cap.
+     * Distinguishes a daily-quota 429 from a per-minute (RPM/TPM) rate-limit 429.
+     * Gemini quota-violation bodies name the violated quota id, and per-day quotas
+     * contain "PerDay" (e.g. {@code ...RequestsPerDayPerProjectPerModel}); RPM/TPM
+     * violations do not. Only a positively identified per-day violation may mark a
+     * key exhausted — anything ambiguous (empty body, missing quota id) is treated
+     * as per-minute and retried after a wait.
+     *
+     * <p>History: this used to be {@code !body.contains("retryDelay")}, which
+     * misclassified TPM 429s (whose bodies can lack retryDelay) as daily — all
+     * keys got marked exhausted within seconds and batches failed fast even
+     * though the TPM window would clear in under a minute (observed in prod:
+     * RPD 14/1000 with TPM pinned at 28.46K/30K and near-zero successes).
      */
     private static boolean isDailyExhaustion(WebClientResponseException e) {
         String body = e.getResponseBodyAsString();
-        return body == null || !body.contains("retryDelay");
+        if (body == null || body.isEmpty()) {
+            return false;
+        }
+        return body.contains("PerDay") || body.contains("per_day");
     }
 
     private String resolveKey(String apiKey) {
