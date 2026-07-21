@@ -2,16 +2,22 @@ package com.loglens.storage;
 
 import io.minio.BucketExistsArgs;
 import io.minio.GetObjectArgs;
+import io.minio.GetPresignedObjectUrlArgs;
 import io.minio.MakeBucketArgs;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
 import io.minio.RemoveObjectArgs;
+import io.minio.StatObjectArgs;
+import io.minio.StatObjectResponse;
+import io.minio.errors.ErrorResponseException;
+import io.minio.http.Method;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.InputStream;
+import java.util.concurrent.TimeUnit;
 import java.util.UUID;
 
 /**
@@ -33,19 +39,29 @@ import java.util.UUID;
 public class MinioStorageService implements FileStorageService {
 
     private final String endpoint;
+    private final String publicEndpoint;
     private final String accessKey;
     private final String secretKey;
     private final String bucket;
 
     private MinioClient client;
+    // Presigned URLs are handed to the BROWSER, so they must embed a host the
+    // browser can actually reach. When the backend talks to storage over an
+    // internal hostname (e.g. http://minio:9000 in docker), that host is useless
+    // to the browser — so presigned URLs are signed with a separate public
+    // endpoint (defaults to the internal one when they're the same, e.g. B2).
+    private MinioClient presignClient;
 
     public MinioStorageService(
         @Value("${loglens.minio.endpoint}") String endpoint,
+        @Value("${loglens.minio.public-endpoint:}") String publicEndpoint,
         @Value("${loglens.minio.access-key}") String accessKey,
         @Value("${loglens.minio.secret-key}") String secretKey,
         @Value("${loglens.minio.bucket}") String bucket
     ) {
         this.endpoint = endpoint;
+        this.publicEndpoint = (publicEndpoint == null || publicEndpoint.isBlank())
+            ? endpoint : publicEndpoint;
         this.accessKey = accessKey;
         this.secretKey = secretKey;
         this.bucket = bucket;
@@ -57,6 +73,9 @@ public class MinioStorageService implements FileStorageService {
             .endpoint(endpoint)
             .credentials(accessKey, secretKey)
             .build();
+        this.presignClient = publicEndpoint.equals(endpoint)
+            ? this.client
+            : MinioClient.builder().endpoint(publicEndpoint).credentials(accessKey, secretKey).build();
         try {
             boolean exists = client.bucketExists(BucketExistsArgs.builder().bucket(bucket).build());
             if (!exists) {
@@ -85,6 +104,46 @@ public class MinioStorageService implements FileStorageService {
             throw new StorageException("Failed to store object " + objectKey, e);
         }
         return "s3://" + bucket + "/" + objectKey;
+    }
+
+    @Override
+    public String objectUrl(UUID sessionId, UUID documentId) {
+        return "s3://" + bucket + "/" + sessionId + "/" + documentId;
+    }
+
+    @Override
+    public String presignPut(UUID sessionId, UUID documentId, int expirySeconds) {
+        String objectKey = sessionId + "/" + documentId;
+        try {
+            // Not binding Content-Type into the signature: the browser may send
+            // any (or none), which avoids SigV4 signed-header mismatches.
+            return presignClient.getPresignedObjectUrl(GetPresignedObjectUrlArgs.builder()
+                .method(Method.PUT)
+                .bucket(bucket)
+                .object(objectKey)
+                .expiry(expirySeconds, TimeUnit.SECONDS)
+                .build());
+        } catch (Exception e) {
+            throw new StorageException("Failed to presign PUT for " + objectKey, e);
+        }
+    }
+
+    @Override
+    public long statSize(String fileUrl) {
+        String objectKey = objectKeyFromUrl(fileUrl);
+        try {
+            StatObjectResponse st = client.statObject(StatObjectArgs.builder()
+                .bucket(bucket)
+                .object(objectKey)
+                .build());
+            return st.size();
+        } catch (ErrorResponseException e) {
+            // NoSuchKey (object never uploaded / wrong key) → not an error here,
+            // it's the signal the presigned upload didn't land.
+            return -1L;
+        } catch (Exception e) {
+            throw new StorageException("Failed to stat object " + fileUrl, e);
+        }
     }
 
     @Override

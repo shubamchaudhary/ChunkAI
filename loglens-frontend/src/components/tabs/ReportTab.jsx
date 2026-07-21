@@ -1,8 +1,9 @@
 import { fmtTime } from '../../utils/format';
+import Markdown from '../Markdown';
 
 /**
  * Final incident report. The backend stores it as markdown (content_md); we
- * render it in a readable, whitespace-preserving block (no markdown dependency).
+ * render it as a proper formatted document (headings, lists, tables).
  */
 export default function ReportTab({ report }) {
   if (!report || !report.contentMd) {
@@ -20,10 +21,8 @@ export default function ReportTab({ report }) {
         <h3 className="text-sm font-semibold text-gray-800">Incident report</h3>
         <span className="text-xs text-gray-400">Generated {fmtTime(report.generatedAt)}</span>
       </div>
-      <div className="p-6">
-        <div className="whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-800 font-[system-ui]">
-          {report.contentMd}
-        </div>
+      <div className="px-6 py-4">
+        <Markdown>{report.contentMd}</Markdown>
       </div>
     </div>
   );

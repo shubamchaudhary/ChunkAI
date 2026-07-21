@@ -117,6 +117,94 @@ public class DocumentController {
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(UploadResponse.of(saved));
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Presigned direct-to-blob upload (browser PUTs bytes to storage; the app
+    // server never touches them). Two steps: presign → (browser PUT) → confirm.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** How long a presigned upload URL stays valid. */
+    private static final int PRESIGN_EXPIRY_SECONDS = 15 * 60;
+
+    @PostMapping("/presign")
+    public ResponseEntity<PresignResponse> presign(
+        @PathVariable UUID sessionId,
+        @RequestBody PresignRequest req,
+        Authentication authentication
+    ) {
+        UUID userId = UUID.fromString(authentication.getName());
+        if (sessionRepository.findByIdAndUserId(sessionId, userId).isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        String fileName = (req == null || req.getFileName() == null || req.getFileName().isBlank())
+            ? "upload-" + Instant.now().toEpochMilli() : req.getFileName();
+        long sizeHint = req == null || req.getFileSizeBytes() == null ? 0L : req.getFileSizeBytes();
+
+        // Idempotent: identical file already present → skip the upload entirely.
+        Optional<Document> existing = documentRepository
+            .findBySessionIdAndOriginalFileNameAndFileSizeBytes(sessionId, fileName, sizeHint);
+        if (existing.isPresent()) {
+            return ResponseEntity.ok(PresignResponse.duplicate(existing.get()));
+        }
+
+        UUID documentId = UUID.randomUUID();
+        String uploadUrl = fileStorageService.presignPut(sessionId, documentId, PRESIGN_EXPIRY_SECONDS);
+        log.info("Presigned upload for session {} doc {} ('{}')", sessionId, documentId, fileName);
+        return ResponseEntity.ok(PresignResponse.fresh(documentId, uploadUrl));
+    }
+
+    @PostMapping("/{documentId}/confirm")
+    public ResponseEntity<UploadResponse> confirm(
+        @PathVariable UUID sessionId,
+        @PathVariable UUID documentId,
+        @RequestBody ConfirmRequest req,
+        Authentication authentication
+    ) {
+        UUID userId = UUID.fromString(authentication.getName());
+        if (sessionRepository.findByIdAndUserId(sessionId, userId).isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+
+        String fileUrl = fileStorageService.objectUrl(sessionId, documentId);
+        // The object's real size is the authoritative one (and proves the upload
+        // actually landed — a missing object means the browser PUT never happened).
+        long sizeBytes = fileStorageService.statSize(fileUrl);
+        if (sizeBytes < 0) {
+            log.warn("Confirm for session {} doc {} but no staged object found", sessionId, documentId);
+            return ResponseEntity.badRequest().build();
+        }
+        String fileName = (req == null || req.getFileName() == null || req.getFileName().isBlank())
+            ? "upload-" + Instant.now().toEpochMilli() : req.getFileName();
+
+        Document saved;
+        try {
+            saved = documentRepository.save(Document.builder()
+                .id(documentId)
+                .userId(userId)
+                .sessionId(sessionId)
+                .originalFileName(fileName)
+                .fileUrl(fileUrl)
+                .fileSizeBytes(sizeBytes)
+                .processingStatus(ProcessingStatus.PENDING)
+                .stagedFileDeleted(false)
+                .build());
+        } catch (DataIntegrityViolationException race) {
+            // Lost a race on uq_doc_per_session (same file confirmed twice) — drop
+            // our staged object and return the winner.
+            fileStorageService.delete(fileUrl);
+            return documentRepository
+                .findBySessionIdAndOriginalFileNameAndFileSizeBytes(sessionId, fileName, sizeBytes)
+                .map(winner -> ResponseEntity.ok(UploadResponse.of(winner)))
+                .orElseThrow(() -> race);
+        }
+
+        kafkaTemplate.send(KafkaTopics.LOG_INGEST_REQUESTS, sessionId.toString(),
+            new IngestRequest(sessionId, userId, documentId, fileUrl));
+
+        log.info("Confirmed document {} for session {} ({} bytes) → {}",
+            documentId, sessionId, sizeBytes, KafkaTopics.LOG_INGEST_REQUESTS);
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(UploadResponse.of(saved));
+    }
+
     @GetMapping
     public ResponseEntity<List<UploadResponse>> list(
         @PathVariable UUID sessionId,
@@ -129,6 +217,38 @@ public class DocumentController {
         List<UploadResponse> docs = documentRepository.findBySessionIdOrderByUploadedAtDesc(sessionId)
             .stream().map(UploadResponse::of).toList();
         return ResponseEntity.ok(docs);
+    }
+
+    @Data
+    public static class PresignRequest {
+        private String fileName;
+        private Long fileSizeBytes;
+        private String contentType;
+    }
+
+    @Data
+    public static class ConfirmRequest {
+        private String fileName;
+    }
+
+    @Data
+    @Builder
+    public static class PresignResponse {
+        private UUID documentId;
+        private String uploadUrl;
+        private boolean duplicate;
+        private UploadResponse document; // set only when duplicate == true
+
+        static PresignResponse fresh(UUID documentId, String uploadUrl) {
+            return PresignResponse.builder()
+                .documentId(documentId).uploadUrl(uploadUrl).duplicate(false).build();
+        }
+
+        static PresignResponse duplicate(Document existing) {
+            return PresignResponse.builder()
+                .documentId(existing.getId()).duplicate(true)
+                .document(UploadResponse.of(existing)).build();
+        }
     }
 
     @Data

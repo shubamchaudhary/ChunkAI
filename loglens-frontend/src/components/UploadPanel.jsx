@@ -19,14 +19,16 @@ export default function UploadPanel({ sessionId, onUploaded }) {
     setUploading(true);
     setPct(0);
     try {
-      await documentAPI.upload(sessionId, file, (e) => {
+      // Direct-to-blob: the file bytes go straight to storage via a presigned
+      // URL; the backend never handles them. Progress tracks the PUT to storage.
+      await documentAPI.uploadDirect(sessionId, file, (e) => {
         if (e.total) setPct(Math.round((e.loaded / e.total) * 100));
       });
       onUploaded?.(file.name);
     } catch (e) {
       const status = e.response?.status;
       if (status === 404) setError('Session not found.');
-      else if (status === 400) setError('That file looks empty.');
+      else if (status === 400) setError('Upload did not complete — please try again.');
       else setError(e.response?.data?.message || 'Upload failed. Is the backend running?');
     } finally {
       setUploading(false);

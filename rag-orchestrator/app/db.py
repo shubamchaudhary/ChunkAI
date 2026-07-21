@@ -121,6 +121,35 @@ def session_exists(session_id: str) -> bool:
 
 # ── Graph 2 retrieval ──────────────────────────────────────────────────────
 
+# Reciprocal Rank Fusion constant. Standard default (Cormack et al. 2009): damps
+# the weight of very-top ranks so a chunk ranked highly by BOTH retrievers beats
+# one ranked #1 by only one. Larger k = flatter weighting.
+_RRF_K = 60
+
+
+def _rrf_fuse(
+    ranked_lists: list[list[dict[str, Any]]], limit: int
+) -> list[dict[str, Any]]:
+    """
+    Reciprocal Rank Fusion: merge several independently-ranked result lists into
+    one. Each chunk scores Σ 1/(k + rank) over the lists it appears in (rank is
+    0-based within each list), so items ranked highly by EITHER retriever — and
+    especially by BOTH — rise to the top, without needing the retrievers' raw
+    scores to be comparable (cosine distance vs ts_rank are different units).
+    """
+    fused: dict[Any, dict[str, Any]] = {}
+    scores: dict[Any, float] = {}
+    for ranked in ranked_lists:
+        for rank, row in enumerate(ranked):
+            cid = row["chunk_id"]
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (_RRF_K + rank)
+            fused.setdefault(cid, row)
+    ordered = sorted(fused.values(), key=lambda r: scores[r["chunk_id"]], reverse=True)
+    for r in ordered:
+        r["score"] = round(scores[r["chunk_id"]], 6)
+    return ordered[:limit]
+
+
 def retrieve_chunks(
     session_id: str,
     query_embedding: Optional[list[float]],
@@ -128,58 +157,60 @@ def retrieve_chunks(
     limit: int,
 ) -> list[dict[str, Any]]:
     """
-    Hybrid recall over one session's chunk table: pgvector kNN on the embedded
-    question UNION GIN full-text on the raw question, de-duplicated by chunk_id.
-    Falls back to FTS-only if no embedding is available.
+    Hybrid retrieval over one session's chunk table, fused with Reciprocal Rank
+    Fusion (RRF): pgvector kNN on the embedded question AND GIN full-text on the
+    raw question are each ranked independently, then merged by RRF so a chunk
+    strong on either signal (and especially both) ranks highest. Falls back to
+    FTS-only when no embedding is available.
     """
     table = chunk_table(session_id)  # validated UUID -> safe
-    results: dict[Any, dict[str, Any]] = {}
+    ranked_lists: list[list[dict[str, Any]]] = []
 
+    # Retriever 1 — semantic (vector kNN), already ordered best-first by distance.
     if query_embedding is not None:
         vec = "[" + ",".join(str(x) for x in query_embedding) + "]"
         knn_sql = (
-            f"SELECT chunk_id, line_start, line_end, time_bucket, content, "
-            f"1 - (embedding <=> %s::vector) AS score "
+            f"SELECT chunk_id, line_start, line_end, time_bucket, content "
             f"FROM {table} WHERE embedding IS NOT NULL "
             f"ORDER BY embedding <=> %s::vector LIMIT %s"
         )
         with connect() as conn, conn.cursor() as cur:
-            cur.execute(knn_sql, (vec, vec, limit))
-            for row in cur.fetchall():
-                results[row["chunk_id"]] = row
+            cur.execute(knn_sql, (vec, limit))
+            ranked_lists.append(cur.fetchall())
 
+    # Retriever 2 — lexical (full-text), ranked by ts_rank so RRF gets real ranks.
     fts_sql = (
-        f"SELECT chunk_id, line_start, line_end, time_bucket, content, "
-        f"NULL::float8 AS score "
+        f"SELECT chunk_id, line_start, line_end, time_bucket, content "
         f"FROM {table} "
         f"WHERE to_tsvector('simple', content) @@ websearch_to_tsquery('simple', %s) "
+        f"ORDER BY ts_rank(to_tsvector('simple', content), "
+        f"websearch_to_tsquery('simple', %s)) DESC "
         f"LIMIT %s"
     )
     with connect() as conn, conn.cursor() as cur:
-        cur.execute(fts_sql, (query_text, limit))
-        for row in cur.fetchall():
-            results.setdefault(row["chunk_id"], row)
+        cur.execute(fts_sql, (query_text, query_text, limit))
+        ranked_lists.append(cur.fetchall())
+
+    fused = _rrf_fuse(ranked_lists, limit)
+    if fused:
+        return fused
 
     # websearch_to_tsquery AND-matches every term, so a long natural-language
-    # question often matches nothing. If full-text found nothing (common when
-    # vectors are also missing), retry with an OR of the individual terms so
-    # full-text can still surface partial matches.
-    if not results:
-        terms = re.findall(r"[A-Za-z0-9_]+", query_text)
-        if terms:
-            or_query = " | ".join(terms)
-            or_sql = (
-                f"SELECT chunk_id, line_start, line_end, time_bucket, content, "
-                f"NULL::float8 AS score "
-                f"FROM {table} "
-                f"WHERE to_tsvector('simple', content) @@ to_tsquery('simple', %s) "
-                f"ORDER BY ts_rank(to_tsvector('simple', content), "
-                f"to_tsquery('simple', %s)) DESC "
-                f"LIMIT %s"
-            )
-            with connect() as conn, conn.cursor() as cur:
-                cur.execute(or_sql, (or_query, or_query, limit))
-                for row in cur.fetchall():
-                    results.setdefault(row["chunk_id"], row)
+    # question can match nothing on both nets. Fall back to an OR of the terms.
+    terms = re.findall(r"[A-Za-z0-9_]+", query_text)
+    if terms:
+        or_query = " | ".join(terms)
+        or_sql = (
+            f"SELECT chunk_id, line_start, line_end, time_bucket, content, "
+            f"NULL::float8 AS score "
+            f"FROM {table} "
+            f"WHERE to_tsvector('simple', content) @@ to_tsquery('simple', %s) "
+            f"ORDER BY ts_rank(to_tsvector('simple', content), "
+            f"to_tsquery('simple', %s)) DESC "
+            f"LIMIT %s"
+        )
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(or_sql, (or_query, or_query, limit))
+            return cur.fetchall()
 
-    return list(results.values())[:limit]
+    return []

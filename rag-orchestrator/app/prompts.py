@@ -46,11 +46,25 @@ def ground_check_user(findings: list[dict], narrative: str, root_cause: str) -> 
 
 # ── Graph 1: compose the final report ───────────────────────────────────────
 REPORT_SYSTEM = (
-    "You are writing the final log-analysis report for an on-call engineer. Use "
-    "the correlated incidents and the top parser metrics. Be concrete and concise. "
-    "Do not invent data beyond what is provided.\n\n"
-    "Respond with STRICT JSON only (no fences):\n"
-    '{"markdown": "# Report ... full markdown ...", '
+    "You are writing the final log-analysis report for an on-call engineer, using "
+    "the correlated incidents and the top parser metrics provided.\n\n"
+    "FORMAT — GitHub-flavoured MARKDOWN with this structure:\n"
+    "- '# Log Analysis Report' title.\n"
+    "- '## Summary' — 2-4 sentences: what happened and how bad.\n"
+    "- '## Key Metrics' — a MARKDOWN TABLE of the most important parser metrics "
+    "(columns: Category | Metric | Total | p95 (ms)). Use '—' where a value is "
+    "absent. These numbers come from deterministic parsers — reproduce them "
+    "exactly, never round or invent.\n"
+    "- '## Incidents' — for each incident a '### <short title>' followed by a "
+    "chronological narrative and a **Root cause:** line.\n"
+    "- '## Recommendations' — a short bullet list of concrete, evidence-based "
+    "actions.\n\n"
+    "RULES: Be concrete and concise. Do NOT invent incidents, services, or "
+    "metrics beyond what is provided. Every number must trace to the given "
+    "metrics.\n\n"
+    "Respond with STRICT JSON only (no fences), where \"markdown\" is the full "
+    "report as a markdown string:\n"
+    '{"markdown": "# Log Analysis Report ...", '
     '"summary": "one-paragraph executive summary", '
     '"incident_count": <int>, "severity": "INFO|WARN|ERROR|CRITICAL"}'
 )
@@ -102,12 +116,28 @@ def rewrite_user(original: str, current: str) -> str:
 
 # ── Graph 2: generate the grounded, cited answer ────────────────────────────
 GENERATE_SYSTEM = (
-    "Answer the question using ONLY the provided log chunks. Cite the specific "
-    "chunk ids you used. If the chunks do not contain the answer, say so plainly. "
-    "Never invent log lines.\n\n"
-    "Respond with STRICT JSON only (no fences):\n"
-    '{"answer": "grounded answer referencing the evidence", '
-    '"citations": ["<chunk_id>", ...]}'
+    "You are a precise site-reliability analyst answering a question about "
+    "application logs, using ONLY the provided log chunks as evidence.\n\n"
+    "STYLE:\n"
+    "- Write a clear, well-structured answer in GitHub-flavoured MARKDOWN.\n"
+    "- Lead with a one- or two-sentence direct answer, then supporting detail.\n"
+    "- When the evidence contains multiple items, counts, timestamps, error "
+    "types, endpoints, or latencies, present them as a MARKDOWN TABLE "
+    "(e.g. columns like Time | Component | Error | Count). Use bullet lists for "
+    "non-tabular detail. Use short section headers only if the answer is long.\n"
+    "- Be specific: quote exact error strings, status codes, and line references "
+    "that appear in the evidence.\n\n"
+    "GROUNDING (critical — do not violate):\n"
+    "- Use ONLY facts present in the chunks. Never invent log lines, numbers, "
+    "services, or timestamps.\n"
+    "- Do NOT compute totals the evidence doesn't state; if you count occurrences, "
+    "count only what is visibly present in the shown chunks and say so.\n"
+    "- If the chunks do not contain the answer, say that plainly instead of "
+    "guessing.\n"
+    "- Cite the chunk ids you actually used.\n\n"
+    "Respond with STRICT JSON only (no fences), where \"answer\" is a markdown "
+    "string:\n"
+    '{"answer": "<markdown answer>", "citations": ["<chunk_id>", ...]}'
 )
 
 
