@@ -55,12 +55,21 @@ public class TimeWindowChunker {
         this.windowSeconds = windowSeconds;
     }
 
+    public List<LogWindow> chunk(List<String> rawLines) {
+        return chunk(rawLines, 0L);
+    }
+
     /**
      * Split the given lines (already read in file order) into windows. The caller
      * streams the file line-by-line into this list; the whole file is never held
      * as a single blob.
+     *
+     * <p>{@code globalLineOffset} is the number of lines before this slice in the
+     * ORIGINAL file (0 for a whole-file call). It only affects the no-timestamp
+     * fallback: synthetic buckets are derived from the GLOBAL line number so
+     * independently-processed parts of the same file agree without coordination.
      */
-    public List<LogWindow> chunk(List<String> rawLines) {
+    public List<LogWindow> chunk(List<String> rawLines, long globalLineOffset) {
         int n = rawLines.size();
         if (n == 0) {
             return List.of();
@@ -73,7 +82,7 @@ public class TimeWindowChunker {
             any |= ts[i] != null;
         }
         if (!any) {
-            return fallbackByLineCount(rawLines);
+            return fallbackByLineCount(rawLines, globalLineOffset);
         }
 
         // Forward-fill: a line with no timestamp joins the current window; leading
@@ -111,21 +120,23 @@ public class TimeWindowChunker {
         return windows;
     }
 
-    private List<LogWindow> fallbackByLineCount(List<String> rawLines) {
+    private List<LogWindow> fallbackByLineCount(List<String> rawLines, long globalLineOffset) {
         List<LogWindow> windows = new ArrayList<>();
         int n = rawLines.size();
-        int windowIndex = 0;
         for (int start = 0; start < n; start += FALLBACK_WINDOW_LINES) {
             int end = Math.min(start + FALLBACK_WINDOW_LINES, n);
-            Instant synthetic = Instant.EPOCH.plusSeconds((long) windowIndex * windowSeconds);
+            // Global window index so parts of one file produce non-overlapping,
+            // monotonic synthetic buckets without talking to each other.
+            long globalWindowIndex = (globalLineOffset + start) / FALLBACK_WINDOW_LINES;
+            Instant synthetic = Instant.EPOCH.plusSeconds(globalWindowIndex * windowSeconds);
             windows.add(new LogWindow(synthetic, start + 1, end,
                 new ArrayList<>(rawLines.subList(start, end))));
-            windowIndex++;
         }
         return windows;
     }
 
-    private Instant bucketOf(Instant t) {
+    /** Floor an instant to its {@code windowSeconds} bucket. Used by the splitter. */
+    Instant bucketOf(Instant t) {
         long epoch = t.getEpochSecond();
         long floored = epoch - Math.floorMod(epoch, windowSeconds);
         return Instant.ofEpochSecond(floored);

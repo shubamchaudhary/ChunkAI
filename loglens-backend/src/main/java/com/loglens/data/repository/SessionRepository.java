@@ -33,6 +33,15 @@ public interface SessionRepository extends JpaRepository<Session, UUID> {
     @Query("update Session s set s.totalWindows = :total where s.id = :id")
     void setTotalWindows(@Param("id") UUID id, @Param("total") int total);
 
+    /**
+     * Additive form of {@link #setTotalWindows} — the finalizer adds a document's
+     * work-item count so multi-document sessions accumulate a correct target.
+     */
+    @Modifying
+    @Transactional
+    @Query("update Session s set s.totalWindows = s.totalWindows + :delta where s.id = :id")
+    void addTotalWindows(@Param("id") UUID id, @Param("delta") int delta);
+
     @Modifying
     @Transactional
     @Query("update Session s set s.analysisStatus = com.loglens.common.constants.AnalysisStatus.FAILED, "

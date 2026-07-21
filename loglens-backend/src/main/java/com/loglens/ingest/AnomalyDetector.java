@@ -83,6 +83,28 @@ public class AnomalyDetector {
         }
     }
 
+    /**
+     * LOCAL anomaly rules only — parser intrinsic problems and WARN bursts — for
+     * partitioned ingest, where a single part cannot know the corpus-wide p95. The
+     * latency-outlier rule (3× corpus p95) is applied later, once, by the finalizer
+     * as a single SQL {@code percentile_cont} pass over {@code log_metrics}.
+     */
+    public void detectLocal(List<LogWindow> windows) {
+        for (LogWindow w : windows) {
+            boolean anomalous = false;
+            for (LogWindowParser p : parsers) {
+                if (p.isAnomalous(w)) {
+                    anomalous = true;
+                    break;
+                }
+            }
+            if (!anomalous && warnCount(w) >= WARN_THRESHOLD) {
+                anomalous = true;
+            }
+            w.setAnomalous(anomalous);
+        }
+    }
+
     private long warnCount(LogWindow window) {
         long c = 0;
         for (String line : window.lines()) {

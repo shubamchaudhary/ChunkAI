@@ -160,6 +160,24 @@ public class MinioStorageService implements FileStorageService {
     }
 
     @Override
+    public InputStream openStream(String fileUrl, long offset, long length) {
+        String objectKey = objectKeyFromUrl(fileUrl);
+        try {
+            // Ranged GET: the same call with S3 offset/length — the server returns
+            // only the requested byte range, so heap stays O(length).
+            return client.getObject(GetObjectArgs.builder()
+                .bucket(bucket)
+                .object(objectKey)
+                .offset(offset)
+                .length(length)
+                .build());
+        } catch (Exception e) {
+            throw new StorageException("Failed to open ranged object " + fileUrl
+                + " [" + offset + "," + (offset + length) + ")", e);
+        }
+    }
+
+    @Override
     public void delete(String fileUrl) {
         String objectKey = objectKeyFromUrl(fileUrl);
         try {

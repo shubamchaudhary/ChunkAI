@@ -96,6 +96,44 @@ public class SessionChunkRepository {
         jdbc.update("DELETE FROM " + table + " WHERE document_id = ?", documentId);
     }
 
+    /** A chunk id + whether it is (finally) flagged anomalous — the finalizer's fan-out input. */
+    public record ChunkRef(UUID chunkId, boolean anomalous) {
+    }
+
+    /** All chunk refs for a document, for the finalizer's enrichment fan-out. */
+    public List<ChunkRef> listChunkRefs(UUID sessionId, UUID documentId) {
+        String table = tableManager.tableName(sessionId); // validated UUID → safe
+        return jdbc.query(
+            "SELECT chunk_id, is_anomalous FROM " + table + " WHERE document_id = ? ORDER BY line_start",
+            (rs, i) -> new ChunkRef(rs.getObject("chunk_id", UUID.class), rs.getBoolean("is_anomalous")),
+            documentId);
+    }
+
+    /**
+     * Global latency-outlier rule (replaces AnomalyDetector's in-memory p95 pass):
+     * compute the corpus p95 per latency metric with SQL {@code percentile_cont},
+     * then flag every chunk whose time bucket has a latency &gt; 3× that p95. Runs
+     * once, in the finalizer, over metrics already in Postgres. Returns rows flagged.
+     */
+    @Transactional
+    public int flagLatencyOutliers(UUID sessionId) {
+        String table = tableManager.tableName(sessionId); // validated UUID → safe
+        String sql =
+            "WITH corpus AS (" +
+            "  SELECT category, metric, " +
+            "    percentile_cont(0.95) WITHIN GROUP (ORDER BY p95_ms::double precision) AS p95 " +
+            "  FROM log_metrics WHERE session_id = ? AND p95_ms IS NOT NULL " +
+            "  GROUP BY category, metric" +
+            "), outlier_buckets AS (" +
+            "  SELECT DISTINCT m.time_bucket FROM log_metrics m " +
+            "  JOIN corpus c ON m.category = c.category AND m.metric = c.metric " +
+            "  WHERE m.session_id = ? AND c.p95 > 0 AND m.p95_ms > 3 * c.p95" +
+            ") UPDATE " + table + " lc SET is_anomalous = true " +
+            "WHERE lc.is_anomalous = false " +
+            "AND lc.time_bucket IN (SELECT time_bucket FROM outlier_buckets)";
+        return jdbc.update(sql, sessionId, sessionId);
+    }
+
     /** A chunk's stored text plus its window bucket, for building enrichment prompts. */
     public record ChunkContent(UUID chunkId, Instant timeBucket, String content) {
     }

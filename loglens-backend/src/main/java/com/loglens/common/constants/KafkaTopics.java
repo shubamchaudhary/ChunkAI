@@ -14,6 +14,13 @@ public final class KafkaTopics {
     /** Upload accepted → request ingest/chunking. Key = sessionId. */
     public static final String LOG_INGEST_REQUESTS = "log.ingest.requests";
 
+    /**
+     * Virtual parts (window-aligned byte ranges) of one staged file, produced by
+     * the splitter and consumed in parallel. Key = {@code documentId:partIdx} so a
+     * document's parts spread across partitions (never pinned to one).
+     */
+    public static final String LOG_INGEST_PARTS = "log.ingest.parts";
+
     /** Dead letters from the ingest lane (poison ingest requests). */
     public static final String LOG_INGEST_DLQ = "log.ingest.dlq";
 
