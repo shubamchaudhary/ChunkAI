@@ -67,6 +67,8 @@ export const sessionAPI = {
 
 export const documentAPI = {
   list: (sessionId) => api.get(`/sessions/${sessionId}/documents`),
+
+  // Legacy stream-through upload (kept as a fallback). Prefer uploadDirect.
   upload: (sessionId, file, onUploadProgress) => {
     const formData = new FormData();
     formData.append('file', file);
@@ -75,6 +77,39 @@ export const documentAPI = {
       timeout: 300000,
       onUploadProgress,
     });
+  },
+
+  presign: (sessionId, file) =>
+    api.post(`/sessions/${sessionId}/documents/presign`, {
+      fileName: file.name,
+      fileSizeBytes: file.size,
+      contentType: file.type || 'application/octet-stream',
+    }),
+
+  confirm: (sessionId, documentId, file) =>
+    api.post(`/sessions/${sessionId}/documents/${documentId}/confirm`, {
+      fileName: file.name,
+    }),
+
+  /**
+   * Presigned direct-to-blob upload: ask the backend for a presigned PUT URL,
+   * upload the bytes straight to storage (the app server never sees them), then
+   * confirm so the backend records the row and kicks off the pipeline.
+   */
+  uploadDirect: async (sessionId, file, onUploadProgress) => {
+    const { data: presign } = await documentAPI.presign(sessionId, file);
+    if (presign.duplicate) {
+      // Identical file already processed — nothing to upload.
+      return { data: presign.document, duplicate: true };
+    }
+    // Raw PUT to blob storage: NOT the api instance (no Authorization header,
+    // no JSON content-type, no api baseURL — this URL is already fully signed).
+    await axios.put(presign.uploadUrl, file, {
+      headers: { 'Content-Type': 'application/octet-stream' },
+      timeout: 0, // large files; let the browser manage it
+      onUploadProgress,
+    });
+    return documentAPI.confirm(sessionId, presign.documentId, file);
   },
 };
 

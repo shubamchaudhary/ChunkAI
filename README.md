@@ -1,72 +1,160 @@
-# LogLens
+# LogLens — LangGraph-Based Log Intelligence Pipeline
 
-Log intelligence pipeline. Upload a production log archive; get back exact metrics, classified failures, correlated incidents with root-cause narratives, and a generated report — every claim cited back to the actual log lines.
+**Turn a GB-scale log archive into a grounded, cited incident report you can
+interrogate in plain English.**
 
-Built for the question class where standard RAG structurally fails: **whole-corpus analytical questions**. "What defect patterns appeared this week?" isn't answerable from top-10 retrieved chunks — the answer is spread across thousands. LogLens analyzes the entire archive once at ingest, materializes the findings, and answers questions instantly from them.
+Upload a log file → LogLens parses it deterministically for *exact* metrics, uses an
+LLM to explain only the anomalous windows, correlates them into incidents, and lets
+you ask questions answered with citations to the exact log lines. All the expensive AI
+work runs **off the request path, behind a durable queue** — so the system is cheap,
+never loses work, and scales its reasoning cost with the number of *incidents*, not the
+size of the logs.
 
-## Design positions
+🔗 **Live:** [deeploglens.vercel.app](https://deeploglens.vercel.app) ·
+📖 **Deep design walkthrough:** [docs/current-design-walkthrough.md](docs/current-design-walkthrough.md)
 
-- **LLMs never count.** Counts, latencies, and distributions come from deterministic parsers — exact, free, fast. LLM calls are spent only where semantics matter: explaining anomalies, classifying errors, correlating events into incidents. Numbers from parsers, narratives from the model.
-- **Compute understanding once, not per question.** The heavy LLM work (thousands of enrichment calls per corpus) runs at ingest time through durable queues and lands in structured tables. User queries are SQL over those tables — milliseconds, and hallucination-proof by construction, with a grounded RAG drill-down to the raw log lines as the escape hatch.
-- **Rate limits are an architecture problem, not a retry problem.** Enrichment bursts run against per-key API quotas. Work is partitioned one-Kafka-partition-per-API-key — preserving per-key rate limits across any number of workers — with delayed-retry topics for 429s and replayable history for rebuilding anything derived.
-- **A session is a corpus, not a chat.** One session holds one archive (10⁵–10⁶ chunks) in its own physical table with its own vector index: search cost scales with that corpus only, other tenants' data is never touched, and deleting a corpus is a `DROP TABLE`.
+---
 
-## Stack
+## Why it exists
 
-| Technology | Role |
+An on-call engineer at 2 AM with 900,000 log lines has a real, expensive problem. The
+naive fix — "paste the logs into an LLM and ask what broke" — fails, because an LLM
+**cannot count**, **cannot see all the logs at once**, and **will confidently invent**
+numbers and errors. LogLens is built around *trust*:
+
+- **Numbers come from code, not the model.** Deterministic parsers compute every count,
+  rate, and latency. LLMs never count anything.
+- **Explanations must be grounded.** The LLM only explains anomalies, and a second
+  "judge" model rejects any claim not supported by the evidence.
+- **Answers are cited.** Every Q&A response points at the exact log lines it used.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    FE["React (Vercel)"] -->|"presigned PUT"| B2[("Blob storage<br/>Backblaze B2 / MinIO")]
+    FE -->|"confirm"| BE["Spring Boot API (Render)"]
+    BE -->|"pointer, not bytes"| K1{{"Kafka: log.ingest.requests"}}
+    K1 --> SP["Splitter: one streaming pass →<br/>window-aligned byte ranges (O(1) memory)"]
+    SP -->|"K part pointers"| KP{{"Kafka: log.ingest.parts"}}
+    KP --> PC["Part consumers (parallel):<br/>ranged GET → chunk → parse →<br/>1 idempotent transaction"]
+    PC -->|"all parts done<br/>(atomic claim)"| FIN["Finalizer:<br/>global p95 rule → LLM fan-out"]
+    FIN --> K2{{"Kafka: llm.enrich.requests<br/>1 partition per API key"}}
+    K2 --> EC["Enrich consumers:<br/>embeddings (all) + narratives (anomalies)<br/>proactive rate budgets · retry lane · DLQ"]
+    EC --> OR["LangGraph 1 (Python):<br/>cluster → correlate → ground-check →<br/>incidents → report"]
+    FE <-->|"SSE live progress"| ST[("Postgres + pgvector<br/>system of record")]
+    FE -->|"questions"| Q["3-tier query:<br/>SQL · report · Corrective-RAG graph"]
+    BE <--> ST
+    PC --> ST
+    EC --> ST
+    OR --> ST
+```
+
+**Two golden rules the whole design follows:**
+1. *The user-facing request path never does heavy work* — upload returns in
+   milliseconds; everything expensive happens asynchronously behind Kafka.
+2. *Kafka moves facts, blob moves bytes, Postgres holds truth* — messages are tiny
+   pointers, file content never travels through Kafka, every result lands in Postgres.
+
+---
+
+## Tech stack
+
+| Layer | Technology | Role |
+|---|---|---|
+| Frontend | React + Vite (Vercel) | upload, live progress (SSE), report, cited chat |
+| Backend | **Java + Spring Boot** (Render) | auth, presigned upload, all Kafka workers, query APIs |
+| AI orchestrator | **Python + FastAPI + LangGraph** | the two AI graphs: report writing + corrective-RAG Q&A |
+| Messaging | **Kafka** (Redpanda Cloud) | durable buffer; one partition per API key for lock-free rate limiting |
+| Blob storage | Backblaze B2 / MinIO (S3 API) | disposable staging for the raw file; presigned direct-to-blob upload |
+| Database | **PostgreSQL 16 + pgvector** | single system of record — relational + vector + full-text |
+| LLM | Groq (chat/narratives) + Gemini (embeddings) | pluggable behind a provider gateway |
+
+---
+
+## What makes the engineering interesting
+
+- **Memory-bounded ingest.** A streaming splitter emits *window-aligned byte ranges*
+  ("virtual parts", the Hadoop input-split idea); parallel consumers do S3 **ranged
+  GETs** — heap stays **constant** whether the file is 1 MB or 10 GB, no whole-file read.
+- **Rate limits modeled as Kafka partitions.** One partition ↔ one API key ↔ one
+  consumer, so each worker self-paces to its quota with **zero distributed
+  coordination**, and a proactive per-key token budget makes 429s a non-event by
+  construction.
+- **Exactly-once *effect* on at-least-once delivery.** A marker row written in the same
+  transaction as each part's data (plus fingerprint- and id-keyed upserts) makes every
+  redelivery a harmless no-op — no double counts, no lost work; a crash resumes from the
+  last committed offset.
+- **Two-layer extraction.** Regex/Java parsers compute exact metrics on *every* window;
+  the LLM touches *only* anomalous ones — **~90% fewer LLM calls**, and numbers are never
+  hallucinated.
+- **Per-session vector isolation.** Each session gets its own chunk table with a
+  right-sized **HNSW** index, sidestepping the filtered-ANN recall collapse of a shared
+  vector table.
+- **Corrective RAG** for Q&A: retrieve → grade → (rewrite → re-retrieve)* → generate,
+  over **RRF-fused** hybrid vector + full-text search, with citations grounded to exact
+  log lines.
+- **LLM-as-judge grounding loop** so the generated report can't state a claim the
+  evidence doesn't support.
+
+---
+
+## What I deliberately did NOT use (removal is a design signal)
+
+| Cut | Why it isn't needed |
 |---|---|
-| Spring Boot / Java | API, auth, ingestion pipeline, parsers, Kafka consumers |
-| PostgreSQL + pgvector | System of record: sessions, chunks (per-session tables with vector + full-text indexes), metrics, findings, incidents, reports |
-| Apache Kafka | Durable analysis queues; partition-per-API-key LLM lanes; replayable history |
-| MinIO | Temporary staging for uploaded archives — self-hosted, free, S3-compatible; chunker streams and deletes, Postgres holds the durable copy |
-| LangGraph / Python | Correlation & report graphs; grounded drill-down Q&A |
-| Google Gemini | Enrichment, correlation, report generation |
-| React + Vite | Frontend: progress, report, fixed-param queries |
+| **Elasticsearch** | Evidence lookup is by id; keyword search is session-scoped Postgres GIN; semantic is per-session pgvector. One fewer stateful cluster. |
+| **A dedicated vector DB** (Pinecone/Weaviate) | Adds a second store to keep in sync with Postgres for zero gain; pgvector gives isolated ANN *and* transactional joins to the metadata. |
+| **RabbitMQ / SQS** | No log-replay and no partition-ordering-per-key — both of which the rate-limit design depends on. |
+| **A DB-as-queue poller** (the v1 approach) | Deleted ~250 lines of 3-second polling + lease columns when Kafka replaced it: push, exactly-one delivery, offsets survive crashes. |
+| **Kafka exactly-once transactions** | At-least-once + idempotent handlers give equivalent correctness for these write shapes, far more simply. |
+| **Microservices** | Two deployables total (Java monolith + Python AI sidecar), and only because the LangGraph ecosystem is Python. |
 
-Postgres is the only stateful system of record; everything derived (findings, incidents, reports) is rebuildable by replaying Kafka. Uploaded files are staging, not storage — deleted once processed. Deliberately absent: Elasticsearch, a dedicated vector DB, managed cloud storage — each solved a problem this design doesn't have (the cut list with reasoning is in `docs/02`, §4).
+*Full reasoning for every choice — and the rejected alternatives — is in the
+[design walkthrough](docs/current-design-walkthrough.md).*
 
-## High-level flow
+---
+
+## Repository layout
 
 ```
- ANALYSIS (once per archive — heavy, async)
- ───────────────────────────────────────────────────────────────
- upload ──▶ API ──▶ Kafka ──▶ chunk by time window
-                                    │
-                     ┌──────────────┴──────────────┐
-                     ▼                             ▼
-              Layer 1: PARSERS              Layer 2: LLM ENRICHMENT
-              exact counts/latencies        anomalous windows only,
-              → log_metrics                 via per-key Kafka lanes
-                     │                      → log_findings
-                     └──────────┬───────────┘
-                                ▼
-                     CORRELATION (LangGraph)
-                     findings → incidents → REPORT
-
- QUERY (per question — light, instant)
- ───────────────────────────────────────────────────────────────
- fixed-param question ──▶ SQL over metrics/findings/incidents ──▶ answer
- "show me the lines"  ──▶ evidence drill-down (vector + full-text search, grounded RAG)
+loglens-backend/     Spring Boot: auth, upload, Kafka ingest + enrich workers, query APIs
+rag-orchestrator/    Python FastAPI + LangGraph: report graph + corrective-RAG Q&A graph
+loglens-frontend/    React + Vite UI
+docs/                design walkthrough, partitioned-ingest spec, interview defense notes
+docker-compose.yml   local stack: Postgres+pgvector, Kafka, MinIO
 ```
 
-Details — schemas, Kafka topics, extraction taxonomy, trade-off analysis, migration phases — live in [`docs/`](docs/), starting at [`docs/HANDOVER.md`](docs/HANDOVER.md). Document Q&A over PDFs/slides (the v1 feature set) remains a secondary mode on the same machinery.
+---
 
-## Running locally
-
-Java 17+, Node 18+, Docker, and a free Gemini API key ([aistudio.google.com](https://aistudio.google.com/)). Entire stack is free and self-hosted.
+## Run it locally
 
 ```bash
-cp .env.example .env                        # add GEMINI_API_KEYS
-docker-compose up -d                        # postgres+pgvector (kafka/minio join as phases land)
-./gradlew :loglens-backend:bootRun        # api on :8080
-cd loglens-frontend && npm i && npm run dev
+# 1. Infrastructure (Postgres+pgvector, Kafka, MinIO)
+docker compose up -d
+
+# 2. Backend (Java 17+)
+cd loglens-backend && ./gradlew bootRun
+
+# 3. AI orchestrator (Python 3.11+)
+cd rag-orchestrator && pip install -r requirements.txt && uvicorn app.main:app --port 8000
+
+# 4. Frontend
+cd loglens-frontend && npm install && npm run dev
 ```
 
-## Layout
+Set `GROQ_API_KEYS` and `GEMINI_API_KEYS` (comma-separated for the multi-key rate-limit
+pool). The whole stack runs on free tiers at **$0**.
 
-```
-loglens-backend/    Spring Boot backend
-loglens-frontend/    React frontend
-docs/                 architecture, decisions, migration plan
-init.sql              database schema
-```
+---
+
+## Further reading
+
+- **[Design walkthrough](docs/current-design-walkthrough.md)** — end-to-end, every hop,
+  every table, every decision, and *why the obvious alternative was rejected*.
+- **[Partitioned-ingest spec](docs/04-partitioned-ingest-spec.md)** — the memory-bounded
+  ingest redesign.
+- **[Design defense with numbers](docs/interview/02-design-defense.md)** ·
+  **[Honest trade-offs](docs/interview/03-honest-tradeoffs.md)**

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { analysisAPI } from '../services/api';
+import Markdown from './Markdown';
 
 /**
  * Free-form Q&A over the session's own log chunks (orchestrator Graph 2).
@@ -117,8 +118,8 @@ export default function DrilldownPanel({ sessionId }) {
               </div>
             </div>
             <div className="flex justify-start">
-              <div className="bg-gray-100 text-gray-800 rounded-2xl rounded-bl-sm px-4 py-2 text-sm max-w-[85%] whitespace-pre-wrap">
-                {t.answer || 'No answer produced.'}
+              <div className="bg-gray-100 text-gray-800 rounded-2xl rounded-bl-sm px-4 py-2 text-sm max-w-[90%] overflow-x-auto">
+                {t.answer ? <Markdown>{t.answer}</Markdown> : 'No answer produced.'}
               </div>
             </div>
             {t.evidence?.length > 0 && (

@@ -183,7 +183,9 @@ export default function SessionWorkspace({ session, onStatusChange }) {
             ) : (
               <>
                 {tab === 'report' && <ReportTab report={results?.report} />}
-                {tab === 'findings' && <FindingsTab findings={results?.findings} />}
+                {tab === 'findings' && (
+                  <FindingsTab sessionId={sessionId} findings={results?.findings} />
+                )}
                 {tab === 'incidents' && (
                   <IncidentsTab incidents={results?.incidents} findings={results?.findings} />
                 )}
