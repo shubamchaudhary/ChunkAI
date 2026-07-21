@@ -33,6 +33,12 @@ public class KafkaTopicsConfig {
     }
 
     @Bean
+    public NewTopic logIngestPartsTopic() {
+        // 6 partitions = up to 6 parts processed in parallel. Key = documentId:partIdx.
+        return TopicBuilder.name(KafkaTopics.LOG_INGEST_PARTS).partitions(6).replicas(1).build();
+    }
+
+    @Bean
     public NewTopic logIngestDlqTopic() {
         return TopicBuilder.name(KafkaTopics.LOG_INGEST_DLQ).partitions(1).replicas(1).build();
     }

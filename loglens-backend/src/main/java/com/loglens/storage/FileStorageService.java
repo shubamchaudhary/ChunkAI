@@ -40,6 +40,13 @@ public interface FileStorageService {
     /** Open the object referenced by a URL returned from {@link #store}. */
     InputStream openStream(String fileUrl);
 
+    /**
+     * Open only {@code [offset, offset+length)} of the object — a ranged GET. This
+     * is what lets a part consumer read its ~5 MB slice of a GB file with O(part)
+     * memory, never the whole object.
+     */
+    InputStream openStream(String fileUrl, long offset, long length);
+
     /** Remove the object referenced by a URL returned from {@link #store}. */
     void delete(String fileUrl);
 }

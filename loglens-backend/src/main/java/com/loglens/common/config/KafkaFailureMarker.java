@@ -1,6 +1,7 @@
 package com.loglens.common.config;
 
 import com.loglens.common.constants.KafkaTopics;
+import com.loglens.common.messages.IngestPartRequest;
 import com.loglens.common.messages.IngestRequest;
 import com.loglens.data.repository.DocumentRepository;
 import com.loglens.data.repository.SessionRepository;
@@ -38,6 +39,15 @@ public class KafkaFailureMarker {
                     log.warn("Marked session {} / document {} FAILED after exhausted ingest retries: {}",
                         req.sessionId(), req.documentId(), message);
                 }
+            } else if (KafkaTopics.LOG_INGEST_PARTS.equals(record.topic()) && record.value() != null) {
+                IngestPartRequest part = parse(record.value(), IngestPartRequest.class);
+                if (part != null) {
+                    String message = truncate("Part " + part.partIdx() + " failed: " + rootMessage(ex), 1000);
+                    sessionRepository.setFailed(part.sessionId(), message);
+                    documentRepository.markFailed(part.documentId(), message);
+                    log.warn("Marked session {} / document {} FAILED after a poison part {}: {}",
+                        part.sessionId(), part.documentId(), part.partIdx(), message);
+                }
             }
         } catch (Exception inner) {
             log.error("Failure marker could not record consumer failure for topic {}", record.topic(), inner);
@@ -45,14 +55,18 @@ public class KafkaFailureMarker {
     }
 
     private IngestRequest parseIngest(Object value) throws Exception {
-        if (value instanceof IngestRequest ir) {
-            return ir;
+        return parse(value, IngestRequest.class);
+    }
+
+    private <T> T parse(Object value, Class<T> type) throws Exception {
+        if (type.isInstance(value)) {
+            return type.cast(value);
         }
         if (value instanceof String s) {
-            return objectMapper.readValue(s, IngestRequest.class);
+            return objectMapper.readValue(s, type);
         }
         if (value instanceof byte[] bytes) {
-            return objectMapper.readValue(bytes, IngestRequest.class);
+            return objectMapper.readValue(bytes, type);
         }
         return null;
     }

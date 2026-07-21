@@ -57,6 +57,10 @@ CREATE TABLE IF NOT EXISTS documents (
     file_size_bytes     BIGINT NOT NULL,
     processing_status   VARCHAR(20) NOT NULL DEFAULT 'PENDING',
     staged_file_deleted BOOLEAN DEFAULT FALSE,
+    -- Partitioned ingest completion counter: the splitter sets total_parts, each
+    -- part increments parsed_parts; the finalizer fires when they're equal.
+    total_parts         INTEGER NOT NULL DEFAULT 0,
+    parsed_parts        INTEGER NOT NULL DEFAULT 0,
     error_message       TEXT,
     uploaded_at         TIMESTAMPTZ DEFAULT NOW(),
     processed_at        TIMESTAMPTZ,
@@ -66,6 +70,24 @@ CREATE TABLE IF NOT EXISTS documents (
     CONSTRAINT uq_doc_per_session UNIQUE (session_id, original_file_name, file_size_bytes)
 );
 CREATE INDEX IF NOT EXISTS idx_documents_session ON documents(session_id);
+
+-- ============================================================
+-- INGEST_PARTS — per-part redelivery marker for partitioned ingest.
+-- The marker insert shares ONE transaction with the part's chunk/metric
+-- writes, so an at-least-once redelivery of a part hits the PK conflict and
+-- skips everything: exactly-once EFFECT on at-least-once delivery.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS ingest_parts (
+    document_id  UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    part_idx     INTEGER NOT NULL,
+    processed_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (document_id, part_idx)
+);
+
+-- ── Applying to an EXISTING (v2) database — run these once: ──────────────────
+-- ALTER TABLE documents ADD COLUMN IF NOT EXISTS total_parts  INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE documents ADD COLUMN IF NOT EXISTS parsed_parts INTEGER NOT NULL DEFAULT 0;
+-- (then CREATE TABLE ingest_parts above)
 
 -- ============================================================
 -- LOG_METRICS — Layer-1 parser output. One row = one exact

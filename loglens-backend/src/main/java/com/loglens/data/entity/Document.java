@@ -54,6 +54,16 @@ public class Document {
     @Builder.Default
     private Boolean stagedFileDeleted = false;
 
+    /** Partitioned-ingest completion counter: set by the splitter. */
+    @Column(name = "total_parts", nullable = false)
+    @Builder.Default
+    private Integer totalParts = 0;
+
+    /** Partitioned-ingest completion counter: incremented by each part. */
+    @Column(name = "parsed_parts", nullable = false)
+    @Builder.Default
+    private Integer parsedParts = 0;
+
     @Column(name = "error_message")
     private String errorMessage;
 

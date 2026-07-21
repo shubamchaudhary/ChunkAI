@@ -4,6 +4,7 @@ import com.loglens.common.constants.KafkaTopics;
 import com.loglens.common.messages.EnrichRequest;
 import com.loglens.ingest.model.LogWindow;
 import com.loglens.llm.key.ApiKeyManager;
+import com.loglens.storage.SessionChunkRepository.ChunkRef;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -91,6 +92,52 @@ public class EnrichProducer {
 
         log.info("Enqueued enrichment for session {}: {} ENRICH_WINDOW, {} EMBED_BATCH",
             sessionId, windowItems, embedItems);
+    }
+
+    // ── Partitioned-ingest fan-out (from persisted chunk refs, not LogWindows) ──
+
+    /** Work-item count for the finalizer's chunk refs — see {@link #workItemCount(List)}. */
+    public int workItemCountForRefs(List<ChunkRef> refs) {
+        int anomalous = 0;
+        for (ChunkRef r : refs) {
+            if (r.anomalous()) {
+                anomalous++;
+            }
+        }
+        int embedBatches = 0;
+        if (embeddingEnabled && !refs.isEmpty()) {
+            embedBatches = (refs.size() + batchSize - 1) / batchSize;
+        }
+        return anomalous + embedBatches;
+    }
+
+    /** Fan out enrichment for a document's chunks, driven by persisted refs. */
+    public void produceFromRefs(UUID sessionId, List<ChunkRef> refs) {
+        int windowItems = 0;
+        for (ChunkRef r : refs) {
+            if (r.anomalous()) {
+                send(new EnrichRequest(UUID.randomUUID(), sessionId,
+                    EnrichRequest.ENRICH_WINDOW, List.of(r.chunkId()), 0, 0L));
+                windowItems++;
+            }
+        }
+
+        int embedItems = 0;
+        if (embeddingEnabled && !refs.isEmpty()) {
+            List<UUID> chunkIds = new ArrayList<>(refs.size());
+            for (ChunkRef r : refs) {
+                chunkIds.add(r.chunkId());
+            }
+            for (int start = 0; start < chunkIds.size(); start += batchSize) {
+                List<UUID> batch = List.copyOf(chunkIds.subList(start, Math.min(start + batchSize, chunkIds.size())));
+                send(new EnrichRequest(UUID.randomUUID(), sessionId,
+                    EnrichRequest.EMBED_BATCH, batch, 0, 0L));
+                embedItems++;
+            }
+        }
+
+        log.info("Enqueued enrichment for session {}: {} ENRICH_WINDOW, {} EMBED_BATCH (from {} chunk refs)",
+            sessionId, windowItems, embedItems, refs.size());
     }
 
     /** Send one work item to {@code llm.enrich.requests}, spread by workId hash. */
